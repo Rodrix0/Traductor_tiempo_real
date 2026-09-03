@@ -1,0 +1,121 @@
+# =====================================================================
+# Entornos Virtuales
+# =====================================================================
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# =====================================================================
+# Archivos Sensibles, Secretos y Variables de Entorno
+# =====================================================================
+.env
+.env.*
+!.env.example
+secrets/
+secrets.json
+credentials.json
+*.pem
+*.key
+*.token
+*.cert
+
+# =====================================================================
+# Modelos de Inteligencia Artificial y Pesos Pesados
+# (Se descargan localmente y no deben versionarse en el repositorio)
+# =====================================================================
+models/
+*.bin
+*.pt
+*.pth
+*.onnx
+*.safetensors
+*.gguf
+
+# =====================================================================
+# Caché y Archivos de Compilación de Python
+# =====================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# =====================================================================
+# Registros (Logs), Grabaciones y Transcripciones Generadas
+# =====================================================================
+*.log
+logs/
+recordings/
+transcripts/
+*.wav
+*.mp3
+*.flac
+*.m4a
+*.tmp
+*.temp
+
+# =====================================================================
+# Herramientas de Pruebas y Cobertura
+# =====================================================================
+.pytest_cache/
+.coverage
+.coverage.*
+.cache/
+htmlcov/
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+
+# =====================================================================
+# Empaquetado de Windows / PyInstaller
+# =====================================================================
+*.manifest
+*.spec
+dist/
+build/
+*.exe
+
+# =====================================================================
+# IDEs y Editores de Código
+# =====================================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# =====================================================================
+# Archivos del Sistema Operativo (Windows / Mac)
+# =====================================================================
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+[Dd]esktop.ini
+$RECYCLE.BIN/
+.DS_Store
+.AppleDouble
+.LSOverride

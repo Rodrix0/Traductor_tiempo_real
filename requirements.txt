@@ -1,0 +1,9 @@
+# Captura y procesamiento de audio
+sounddevice>=0.4.6
+numpy>=1.24.0,<2.0.0
+
+# Reconocimiento de voz local ultrarrápido (CTranslate2)
+faster-whisper>=1.0.0
+
+# Utilidades de consola y formato
+colorama>=0.4.6
