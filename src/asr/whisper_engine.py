@@ -47,6 +47,8 @@ class WhisperEngine:
 
         target_device = requested_device
         target_compute = requested_compute_type
+        if requested_device != 'auto' and requested_compute_type == 'auto':
+            target_compute = 'int8' if requested_device == 'cpu' else 'float16'
 
         # Si se especificó 'auto', intentar GPU primero
         if requested_device == "auto":

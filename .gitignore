@@ -66,6 +66,7 @@ MANIFEST
 logs/
 recordings/
 transcripts/
+debug_audio/
 *.wav
 *.mp3
 *.flac
@@ -119,3 +120,6 @@ $RECYCLE.BIN/
 .DS_Store
 .AppleDouble
 .LSOverride
+
+# Historial y preferencias locales
+/data/

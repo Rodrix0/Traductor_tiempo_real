@@ -1,7 +1,7 @@
 """
 speech_to_text.py
-Módulo de reconocimiento de voz usando faster-whisper.
-Funciona 100% de forma local, intenta usar GPU NVIDIA automáticamente y recurre a CPU si no está disponible.
+Motor de transcripción de voz a texto local con faster-whisper.
+Configurado para alta precisión en español con beam_size=5 y modelo 'small'.
 """
 
 import os
@@ -15,27 +15,23 @@ os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
 logger = logging.getLogger(__name__)
 
-# Carpeta local para almacenar los modelos de forma permanente
 MODELS_DIR = Path(__file__).resolve().parent / "models"
 MODELS_DIR.mkdir(exist_ok=True)
 
 
 class SpeechToText:
-    """Motor local de transcripción de voz a texto con faster-whisper."""
+    """Motor de transcripción local con faster-whisper cargado una sola vez."""
 
     def __init__(
         self,
-        model_size: str = "base",
-        language: Optional[str] = "es",
+        model_size: str = "small",
+        language: str = "es",
+        beam_size: int = 5,
         download_root: Optional[str] = None,
     ):
-        """
-        :param model_size: Tamaño del modelo ("tiny", "base", "small", "medium").
-        :param language: Código del idioma ("es", "en", etc.) o None para autodetección.
-        :param download_root: Ruta donde guardar el modelo localmente.
-        """
         self.model_size = model_size
         self.language = language
+        self.beam_size = beam_size
         self.download_root = download_root or str(MODELS_DIR)
         self.model = None
         self.device = "cpu"
@@ -44,10 +40,10 @@ class SpeechToText:
         self._load_model()
 
     def _load_model(self) -> None:
-        """Carga el modelo faster-whisper intentando GPU (CUDA) primero y luego CPU."""
+        """Carga el modelo faster-whisper una sola vez."""
         from faster_whisper import WhisperModel
 
-        # 1. Verificar si CTranslate2 detecta GPU CUDA
+        # Comprobar disponibilidad de CUDA
         cuda_supported = False
         try:
             import ctranslate2
@@ -55,34 +51,33 @@ class SpeechToText:
         except Exception:
             cuda_supported = False
 
-        # 2. Intentar cargar en GPU si está disponible
         if cuda_supported:
             try:
-                logger.info("Intentando cargar modelo '%s' en GPU (CUDA float16)...", self.model_size)
-                model_candidate = WhisperModel(
+                logger.info("Intentando cargar Whisper '%s' en GPU (CUDA)...", self.model_size)
+                model_cand = WhisperModel(
                     self.model_size,
                     device="cuda",
                     compute_type="float16",
                     download_root=self.download_root,
                 )
-                # Prueba rápida de inferencia para validar que las librerías cuBLAS / cuDNN estén presentes
+                # Validar con un fragmento dummy que no falten dlls (cublas/cudnn)
                 dummy = np.zeros(1600, dtype=np.float32)
-                list(model_candidate.transcribe(dummy, beam_size=1)[0])
+                list(model_cand.transcribe(dummy, beam_size=1)[0])
 
-                self.model = model_candidate
+                self.model = model_cand
                 self.device = "cuda"
                 self.compute_type = "float16"
-                logger.info("Modelo cargado exitosamente en GPU (CUDA).")
+                logger.info("Whisper '%s' cargado exitosamente en GPU (CUDA).", self.model_size)
                 return
             except Exception as e:
-                logger.warning(
-                    "CUDA no pudo inicializarse (%s). Recurriendo automáticamente a CPU...",
+                logger.info(
+                    "CUDA no disponible o faltan librerías nativas (%s). Recurriendo a CPU...",
                     str(e),
                 )
 
-        # 3. Carga en CPU con cuantización int8 (rápida y compatible con cualquier máquina)
+        # Carga en CPU con int8
+        logger.info("Cargando Whisper '%s' en CPU (int8)...", self.model_size)
         try:
-            logger.info("Cargando modelo '%s' en CPU (int8)...", self.model_size)
             self.model = WhisperModel(
                 self.model_size,
                 device="cpu",
@@ -91,28 +86,35 @@ class SpeechToText:
             )
             self.device = "cpu"
             self.compute_type = "int8"
-            logger.info("Modelo cargado exitosamente en CPU.")
+            logger.info("Whisper '%s' cargado exitosamente en CPU (int8).", self.model_size)
         except Exception as e:
-            raise RuntimeError(f"Error crítico al cargar el modelo Whisper: {e}") from e
+            raise RuntimeError(f"No se pudo cargar el modelo faster-whisper '{self.model_size}': {e}") from e
 
-    def transcribe(self, audio_data: np.ndarray) -> str:
+    def transcribe(self, audio_16k: np.ndarray) -> str:
         """
         Transcribe un segmento de audio (16kHz float32 mono).
-        Retorna el texto transcrito como una cadena limpia.
+        Retorna la transcripción limpia en español.
         """
         if self.model is None:
-            raise RuntimeError("El modelo de transcripción no está inicializado.")
+            raise RuntimeError("El modelo faster-whisper no está cargado.")
 
-        if len(audio_data) == 0:
+        if len(audio_16k) == 0:
+            return ""
+
+        # Si el audio es silencio puro o energía despreciable, evitar alucinaciones
+        rms = float(np.sqrt(np.mean(audio_16k**2)))
+        if rms < 0.003:
             return ""
 
         try:
-            # Transcripción optimizada para tiempo real y baja latencia
+            # Desactivamos vad_filter interno de Whisper porque nuestro VAD externo ya
+            # recortó la frase exacta. Esto evita que Whisper elimine palabras suaves.
             segments_gen, _ = self.model.transcribe(
-                audio_data,
+                audio_16k,
                 language=self.language,
-                beam_size=1,  # beam_size 1 es el más rápido
-                vad_filter=True,  # Filtro secundario para descartar ruidos de fondo
+                beam_size=self.beam_size,
+                temperature=0.0,
+                vad_filter=False,
                 condition_on_previous_text=False,
             )
 

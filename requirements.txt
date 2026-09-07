@@ -1,9 +1,14 @@
 # Captura y procesamiento de audio
 sounddevice>=0.4.6
 numpy>=1.24.0,<2.0.0
+scipy>=1.10.0
 
 # Reconocimiento de voz local ultrarrápido (CTranslate2)
 faster-whisper>=1.0.0
 
 # Utilidades de consola y formato
 colorama>=0.4.6
+
+# Audio del sistema en Windows y traducción local ES/EN/PT
+PyAudioWPatch>=0.2.12.6; sys_platform == "win32"
+argostranslate>=1.9.6,<2
