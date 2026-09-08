@@ -5,12 +5,21 @@ from unittest.mock import patch
 
 
 class SystemAudioTests(unittest.TestCase):
-    def test_backlog_keeps_recent_segments_with_original_timestamps(self):
+    def test_backlog_preserves_first_segments_with_original_timestamps(self):
         capture = WindowsCapture(0)
         for i in range(6):
             capture.enqueue(AudioSegment(np.zeros(480), i, i + 1))
-        self.assertEqual(capture.dropped, 3)
-        self.assertEqual([capture.segments.get_nowait().start for _ in range(3)], [3, 4, 5])
+        self.assertEqual(capture.dropped, 0)
+        self.assertEqual([capture.segments.get_nowait().start for _ in range(6)], [0,1,2,3,4,5])
+
+    def test_buffer_limit_stops_capture_without_evicting_old_audio(self):
+        capture = WindowsCapture(0, buffer_seconds=2)
+        for i in range(3):
+            capture.enqueue(AudioSegment(np.zeros(16000),i,i+1))
+        self.assertTrue(capture.stopped.is_set())
+        self.assertIsNotNone(capture.error)
+        self.assertEqual(capture.pending_seconds,2)
+        self.assertEqual([capture.segments.get_nowait().start for _ in range(2)],[0,1])
 
     def test_start_reports_device_failure(self):
         def failed(capture):

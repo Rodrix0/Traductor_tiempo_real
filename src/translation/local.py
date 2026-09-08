@@ -33,12 +33,22 @@ def prepare_models(status, stopped):
 class LocalTranslator:
     def __init__(self):
         self.routes = {}
+        self.english_spanish = None
+
+    def _marian_available(self):
+        path = ROOT / 'models' / 'ct2fast-opus-mt-en-es'
+        return all((path / name).is_file() for name in ('model.bin', 'source.spm', 'target.spm'))
 
     def translate(self, text, source, target):
         if source not in LANGUAGES or target not in LANGUAGES:
             raise ValueError("El idioma detectado no es español, inglés ni portugués. Elegí el idioma de origen.")
         if not text.strip() or source == target:
             return text
+        if source == 'en' and target == 'es' and self._marian_available():
+            if self.english_spanish is None:
+                from translator import LocalTranslator as MarianTranslator
+                self.english_spanish = MarianTranslator()
+            return self.english_spanish.translate_en_to_es(text)
         from argostranslate.translate import get_installed_languages
         key = (source, target)
         if key not in self.routes:

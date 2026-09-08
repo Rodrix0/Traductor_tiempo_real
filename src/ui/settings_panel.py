@@ -102,6 +102,8 @@ class SettingsPanel:
             states.append(f'Traducción no disponible: {exc}')
         if self.engine:
             states.append(f'Motor cargado: {self.engine_size[0]} · {self.engine.actual_device.upper()}')
+        if self.translator._marian_available():
+            states.append('Inglés → español: Marian (local)')
         self.inventory.set('   |   '.join(states))
 
     def apply_preferences(self):

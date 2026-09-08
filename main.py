@@ -1,123 +1,121 @@
 """
 main.py
-Reconocimiento de voz local en tiempo real de alta precisión con faster-whisper.
+Traductor y reconocedor de voz en tiempo real de baja latencia.
 
-Flujo:
-MICRÓFONO (Muestreo nativo) -> REMUESTREO 16kHz + VAD -> FASTER-WHISPER 'SMALL' -> TEXTO EN CONSOLA
+Flujo optimizado:
+MICRÓFONO -> VAD RÁPIDO (corte a 400ms) -> FASTER-WHISPER (~0.3s) -> TRADUCTOR LOCAL (~0.1s) -> CONSOLA
 """
 
 import sys
-import os
+import time
 from pathlib import Path
+from colorama import init, Fore, Style
+
 from audio_capture import AudioCapture
 from speech_to_text import SpeechToText
+from translator import LocalTranslator
+
+init(autoreset=True)
 
 # =====================================================================
-# CONFIGURACIÓN DEL USUARIO
+# CONFIGURACIÓN PRINCIPAL
 # =====================================================================
 
-# ID del micrófono a usar (por ejemplo: 1 para 'Microphone Array (AMD Audio Device)')
-# Si se deja en None, seleccionará automáticamente el predeterminado del sistema.
+# Micrófono a usar:
+# ID 1 suele ser 'Microphone Array (AMD Audio Device)'
+# Pon None para usar el predeterminado de Windows
 MIC_DEVICE_ID = 1
 
-# Modelo Whisper de alta precisión
+# Idioma en el que habla la persona / el video:
+# "en" = inglés (recomendado si estás viendo videos en inglés)
+# "es" = español
+# None = detección automática
+INPUT_LANGUAGE = "en"
+
+# ¿Traducir automáticamente al español al terminar la frase?
+# True = muestra el texto original en inglés y su traducción inmediata en español
+# False = solo muestra el texto transcripto
+ENABLE_TRANSLATION = True
+
+# Modelo Whisper:
+# "small" = excelente precisión (~460MB)
+# "base"  = velocidad extrema sub-segundo (~145MB)
 MODEL_SIZE = "small"
 
-# Idioma forzado para evitar confusiones de pronunciación
-INPUT_LANGUAGE = "es"
-
-# Modo de diagnóstico: guarda los audios en WAV para verificar la calidad física
-DEBUG_SAVE_AUDIO = True
+# Guardar archivos WAV para diagnóstico en debug_audio/
+DEBUG_SAVE_AUDIO = False
 DEBUG_DIR = Path(__file__).resolve().parent / "debug_audio"
 
 # =====================================================================
 
 
 def main():
-    # Asegurar compatibilidad UTF-8 en consola de Windows
     if hasattr(sys.stdout, "reconfigure"):
         try:
             sys.stdout.reconfigure(encoding="utf-8")
         except Exception:
             pass
 
-    # 1. Listar micrófonos disponibles y resolver el seleccionado
+    print(Fore.CYAN + "=" * 65)
+    print(Fore.CYAN + Style.BRIGHT + "   TRADUCTOR EN TIEMPO REAL - MODO ULTRA BAJA LATENCIA")
+    print(Fore.CYAN + "=" * 65)
+
+    # 1. Resolver micrófono
     mics = AudioCapture.list_microphones()
     if not mics:
-        print("\n[ERROR] No se detectó ningún micrófono de entrada disponible en el sistema.")
+        print(Fore.RED + "\n[ERROR] No se detectó ningún micrófono de entrada disponible.")
         sys.exit(1)
-
-    print("\n" + "=" * 65)
-    print("Micrófonos de entrada disponibles:")
-    for m in mics:
-        marca = " (Predeterminado)" if m["is_default"] else ""
-        print(f"  [ID {m['id']}] {m['name']}{marca} (Nativo: {int(m['default_samplerate'])} Hz)")
 
     try:
         selected_info = AudioCapture.resolve_microphone(MIC_DEVICE_ID)
     except Exception as e:
-        print(f"\n[ERROR] No se pudo resolver el micrófono solicitado (ID {MIC_DEVICE_ID}): {e}")
+        print(Fore.RED + f"\n[ERROR] ID de micrófono no válido: {e}")
         sys.exit(1)
 
-    print("\nMicrófono seleccionado:")
-    print(f"  [ID {selected_info['id']}] {selected_info['name']}")
+    # 2. Inicializar capturador de audio con corte rápido (400ms silencio)
+    recorder = AudioCapture(
+        device_index=selected_info["id"],
+        target_sample_rate=16000,
+        energy_threshold=0.012,
+        pre_buffer_ms=250,
+        silence_duration_ms=400,       # Corta a los 400ms de terminar la frase
+        min_speech_duration_ms=400,    # Descarta clics o ruidos menores a 0.4s
+        max_speech_duration_ms=4000,   # Corta cada 4s si el habla es continua
+    )
 
-    # 2. Inicializar el capturador de audio
+    # Capturar antes de cargar modelos; conservar las primeras frases en memoria.
+    recorder.start()
     try:
-        recorder = AudioCapture(
-            device_index=selected_info["id"],
-            target_sample_rate=16000,
-            energy_threshold=0.012,
-            pre_buffer_ms=300,
-            silence_duration_ms=800,
-            min_speech_duration_ms=500,
-            max_speech_duration_ms=12000,
-        )
-    except Exception as e:
-        print(f"\n[ERROR] Error al configurar el capturador de audio: {e}")
-        sys.exit(1)
+        print(Fore.WHITE + f"\nCapturando audio. Cargando Whisper ('{MODEL_SIZE}'); el inicio queda en memoria...")
+        engine = SpeechToText(model_size=MODEL_SIZE, default_language=INPUT_LANGUAGE, beam_size=1)
+        translator = None
+        if ENABLE_TRANSLATION and INPUT_LANGUAGE == "en":
+            print(Fore.WHITE + "Cargando traductor local EN -> ES...")
+            translator = LocalTranslator(device="cpu")
+    except BaseException:
+        recorder.stop()
+        raise
 
-    # 3. Inicializar el motor faster-whisper (una sola vez)
-    print(f"\nInicializando motor local Whisper ('{MODEL_SIZE}')...")
-    print("(La primera vez descargará los pesos de 'small' a la carpeta local ./models/)")
-    try:
-        engine = SpeechToText(
-            model_size=MODEL_SIZE,
-            language=INPUT_LANGUAGE,
-            beam_size=5,
-        )
-    except Exception as e:
-        print(f"\n[ERROR] No se pudo inicializar Whisper: {e}")
-        sys.exit(1)
-
-    # 4. Mostrar panel informativo claro
-    print("\n" + "=" * 65)
-    print("   RECONOCIMIENTO DE VOZ EN TIEMPO REAL - MODO ALTA PRECISIÓN")
-    print("=" * 65)
-    print(f" - Modelo               : {MODEL_SIZE}")
-    print(f" - Idioma               : español ('{INPUT_LANGUAGE}')")
-    print(f" - Dispositivo          : {engine.device.upper()} ({engine.compute_type})")
-    print(f" - Micrófono            : [ID {selected_info['id']}] {selected_info['name']}")
-    print(f" - Sample rate Whisper  : 16000 Hz")
-    print(f" - Sample rate micrófono: {recorder.native_sample_rate} Hz (Remuestreado con scipy)")
-    print(f" - Guardado WAV debug   : {'Activado (./debug_audio/)' if DEBUG_SAVE_AUDIO else 'Desactivado'}")
-    print("=" * 65)
-
-    print("\nPRUEBA:")
-    print("Di claramente:")
-    print('  "Hola, esto es una prueba de reconocimiento de voz."\n')
-    print("=" * 65)
-    print("Escuchando continuamente... Presiona [Ctrl + C] para salir.\n")
+    # 5. Panel informativo
+    print("\n" + Fore.CYAN + "=" * 65)
+    print(Fore.WHITE + f" - Micrófono seleccionado : {Fore.YELLOW}[ID {selected_info['id']}] {selected_info['name']}")
+    print(Fore.WHITE + f" - Idioma de entrada     : {Fore.YELLOW}{INPUT_LANGUAGE.upper() if INPUT_LANGUAGE else 'Autodetección'}")
+    print(Fore.WHITE + f" - Traducción automática : {Fore.GREEN + 'Activada (Inglés -> Español)' if translator else Fore.YELLOW + 'Desactivada'}")
+    print(Fore.WHITE + f" - Modelo Whisper        : {Fore.YELLOW}{MODEL_SIZE} (beam_size=1, multi-hilo)")
+    print(Fore.WHITE + f" - Silencio de corte     : {Fore.YELLOW}400 ms (corte inmediato de oración)")
+    print(Fore.CYAN + "=" * 65)
+    print(Fore.GREEN + Style.BRIGHT + "\nEscuchando continuamente... Reproduce el video o habla.")
+    print(Fore.YELLOW + "Presiona [Ctrl + C] para salir en cualquier momento.\n")
+    print(Fore.CYAN + "-" * 65)
 
     if DEBUG_SAVE_AUDIO:
         DEBUG_DIR.mkdir(exist_ok=True)
 
-    recorder.start()
     capture_count = 0
 
     try:
         while True:
-            # Esperar fragmento de voz detectado
+            # Esperar el siguiente fragmento de voz
             item = recorder.get_speech_segment(timeout=0.1)
             if item is None:
                 continue
@@ -125,29 +123,46 @@ def main():
             audio_16k, duration_sec, rms_level = item
             capture_count += 1
 
-            # Mostrar diagnóstico de audio capturado
-            print(f"Duración capturada: {duration_sec:.2f} s")
-            print(f"Nivel RMS: {rms_level:.5f}")
-
-            # Guardar WAV para inspección manual
             if DEBUG_SAVE_AUDIO:
                 wav_path = DEBUG_DIR / f"capture_{capture_count:03d}.wav"
-                AudioCapture.save_wav(audio_16k, str(wav_path), sample_rate=16000)
-                print(f"[Audio guardado en: debug_audio/{wav_path.name}]")
+                AudioCapture.save_wav(audio_16k, str(wav_path))
 
-            # Transcribir con faster-whisper
-            texto = engine.transcribe(audio_16k)
-            if texto:
-                print(f"Texto detectado: {texto}\n")
+            # Transcribir audio
+            asr_res = engine.transcribe(audio_16k, language=INPUT_LANGUAGE)
+            original_text = asr_res["text"]
+            t_asr = asr_res["elapsed_time"]
+
+            if not original_text:
+                continue
+
+            timestamp = time.strftime("%H:%M:%S")
+
+            # Si la traducción está activada y el audio está en inglés
+            if translator is not None:
+                t0_tr = time.perf_counter()
+                trad_text = translator.translate_en_to_es(original_text)
+                t_tr = time.perf_counter() - t0_tr
+                t_total = t_asr + t_tr
+
+                print(
+                    f"{Fore.CYAN}[{timestamp}] "
+                    f"{Fore.LIGHTBLACK_EX}[Audio: {duration_sec:.1f}s | Latencia total: {t_total:.2f}s]\n"
+                    f"  {Fore.YELLOW}Original (EN) : {Fore.WHITE}{original_text}\n"
+                    f"  {Fore.GREEN}{Style.BRIGHT}Traducción(ES): {Fore.WHITE}{Style.BRIGHT}{trad_text}\n"
+                )
             else:
-                print("Texto detectado: (No se distinguió texto claro en este fragmento)\n")
+                print(
+                    f"{Fore.CYAN}[{timestamp}] "
+                    f"{Fore.LIGHTBLACK_EX}[Audio: {duration_sec:.1f}s | Whisper: {t_asr:.2f}s]\n"
+                    f"  {Fore.WHITE}{Style.BRIGHT}Texto detectado: {original_text}\n"
+                )
 
     except KeyboardInterrupt:
-        print("\n\nDetención solicitada por el usuario...")
+        print(Fore.YELLOW + "\n\nDetención solicitada por el usuario...")
 
     finally:
         recorder.stop()
-        print("Captura finalizada y recursos liberados correctamente.")
+        print(Fore.GREEN + "Captura finalizada y recursos liberados correctamente.")
 
 
 if __name__ == "__main__":

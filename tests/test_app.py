@@ -6,9 +6,38 @@ from traductor import TranslatorApp
 from src.subtitles import Caption
 from src.preferences import load_preferences
 from types import SimpleNamespace
+import numpy as np
+import threading
+from src.audio.windows_capture import WindowsCapture, AudioSegment
 
 
 class AppTests(unittest.TestCase):
+    def test_live_captures_first_twenty_seconds_during_model_loading(self):
+        capture = WindowsCapture(10)
+        capture.start = lambda: setattr(capture, 'started', True)
+        capture.stop = lambda: None
+        def load(model):
+            self.assertTrue(capture.started, 'La captura debe abrirse antes de cargar modelos')
+            for i in range(5):
+                capture.enqueue(AudioSegment(np.full(64000,i,dtype=np.float32),i*4,(i+1)*4))
+            self.app.engine = SimpleNamespace(transcribe=lambda audio, **kwargs: {'text':str(int(audio[0])), 'language':'en'})
+        emitted = []
+        original_emit = self.app.emit
+        def emit(kind, value=None):
+            if kind == 'subtitle':
+                emitted.append(value[0])
+                if len(emitted) == 5:
+                    self.app.stopped.set()
+            original_emit(kind,value)
+        with patch('src.audio.windows_capture.WindowsCapture',return_value=capture), patch.object(self.app,'ensure_engine',side_effect=load), patch.object(self.app,'emit',side_effect=emit), patch.object(self.app.translator,'translate',side_effect=lambda text,*args:text):
+            deadline = threading.Timer(2,self.app.stopped.set)
+            deadline.start()
+            try:
+                self.app.run(False,10,'en','es','base')
+            finally:
+                deadline.cancel()
+        self.assertEqual(emitted,['0','1','2','3','4'])
+        self.assertEqual(self.app.store.search()[0]['count'],5)
     def setUp(self):
         self.root = tk.Tk()
         self.root.withdraw()

@@ -30,6 +30,7 @@ class TranslatorApp(SettingsPanel):
         self.capture = None
         self.engine = None
         self.engine_size = None
+        self.translator = LocalTranslator()
         self.overlay = None
         self.caption_updated = 0
         self.file_captions = []
@@ -224,7 +225,7 @@ class TranslatorApp(SettingsPanel):
             self.emit('status', 'Cargando reconocimiento para el archivo…')
             self.ensure_engine(model)
             count = 0
-            for caption in translate_media(path, self.engine, LocalTranslator(), source, target,
+            for caption in translate_media(path, self.engine, self.translator, source, target,
                     self.stopped, lambda text: self.emit('status', text)):
                 self.store.add(session, caption)
                 self.emit('file_caption', caption)
@@ -305,7 +306,7 @@ class TranslatorApp(SettingsPanel):
                 prepare_models(lambda text: self.emit("status", text), self.stopped)
                 if not self.stopped.is_set():
                     self.emit("status", "Verificando modelos y preparando segmentación de frases…")
-                    translator = LocalTranslator()
+                    translator = self.translator
                     samples = {"es": "Hola.", "en": "Hello.", "pt": "Olá."}
                     for source, text in samples.items():
                         for target in LANGUAGES:
@@ -318,28 +319,23 @@ class TranslatorApp(SettingsPanel):
                 self.emit("status", "Preparación detenida." if self.stopped.is_set() else "Idiomas listos: español, inglés y portugués. Ya podés iniciar.")
                 return
             session = self.store.create('Traducción en vivo', 'en vivo', source_lang, target_lang, model_size)
-            from src.asr.whisper_engine import WhisperEngine
             from src.audio.windows_capture import WindowsCapture
-            self.emit("status", "Cargando reconocimiento local (la primera vez puede descargar el modelo)…")
+            self.capture = WindowsCapture(device, threshold=self.active_threshold, chunk_seconds=self.active_chunk)
+            self.capture.start()
+            self.emit("status", "Capturando audio. Cargando reconocimiento; las primeras frases quedan en memoria…")
             self.ensure_engine(model_size)
             if self.stopped.is_set():
                 return
-            translator = LocalTranslator()
-            # Validate all possible routes before opening the audio device.
-            for language in ([source_lang] if source_lang else LANGUAGES):
-                translator.translate("Hola" if language == "es" else "Hello" if language == "en" else "Olá", language, target_lang)
-            if self.stopped.is_set():
-                return
-            self.capture = WindowsCapture(device, threshold=self.active_threshold, chunk_seconds=self.active_chunk)
-            self.capture.start()
-            self.emit("status", "Escuchando… Los subtítulos aparecen por frases, con unos segundos de demora.")
+            translator = self.translator
+            self.emit("status", "Reconocimiento listo. Procesando el audio capturado en orden…")
             while not self.stopped.is_set():
-                if self.capture.error:
+                if self.capture.error and self.capture.segments.empty():
                     raise self.capture.error
                 try:
                     segment = self.capture.segments.get(timeout=0.1)
                 except queue.Empty:
                     continue
+
                 result = self.engine.transcribe(segment.audio, language=source_lang)
                 if not result["text"] or self.stopped.is_set():
                     continue
@@ -350,7 +346,8 @@ class TranslatorApp(SettingsPanel):
                 if not self.stopped.is_set():
                     self.store.add(session, Caption(segment.start, segment.end, result['text'], translated, result['language']))
                     self.emit("subtitle", (result["text"], translated, result["language"]))
-                    self.emit("status", f"Escuchando · {LANGUAGES[result['language']]} → {LANGUAGES[target_lang]} · fragmentos omitidos por demora: {self.capture.dropped}")
+                    delay = max(0, time.monotonic() - segment.captured_at)
+                    self.emit("status", f"{'Captura detenida: procesando el búfer' if self.capture.error else 'Escuchando'} · {LANGUAGES[result['language']]} → {LANGUAGES[target_lang]} · demora: {delay:.1f} s · audio pendiente: {self.capture.pending_seconds:.1f} s")
         except Exception as exc:
             state = 'error'
             self.emit("error", str(exc))

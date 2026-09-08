@@ -1,13 +1,14 @@
 """
 speech_to_text.py
-Motor de transcripción de voz a texto local con faster-whisper.
-Configurado para alta precisión en español con beam_size=5 y modelo 'small'.
+Motor de transcripción local de voz a texto con faster-whisper.
+Optimizado para tiempo real (beam_size=1, hilos de CPU acelerados y temperatura=0.0).
 """
 
 import os
+import time
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any
 import numpy as np
 
 # Silenciar advertencias de symlinks en Windows para HuggingFace Hub
@@ -20,17 +21,17 @@ MODELS_DIR.mkdir(exist_ok=True)
 
 
 class SpeechToText:
-    """Motor de transcripción local con faster-whisper cargado una sola vez."""
+    """Motor de transcripción local optimizado para mínima latencia."""
 
     def __init__(
         self,
         model_size: str = "small",
-        language: str = "es",
-        beam_size: int = 5,
+        default_language: Optional[str] = "en",
+        beam_size: int = 1,
         download_root: Optional[str] = None,
     ):
         self.model_size = model_size
-        self.language = language
+        self.default_language = default_language
         self.beam_size = beam_size
         self.download_root = download_root or str(MODELS_DIR)
         self.model = None
@@ -40,10 +41,9 @@ class SpeechToText:
         self._load_model()
 
     def _load_model(self) -> None:
-        """Carga el modelo faster-whisper una sola vez."""
+        """Carga el modelo faster-whisper una sola vez con soporte multi-hilo en CPU."""
         from faster_whisper import WhisperModel
 
-        # Comprobar disponibilidad de CUDA
         cuda_supported = False
         try:
             import ctranslate2
@@ -60,7 +60,6 @@ class SpeechToText:
                     compute_type="float16",
                     download_root=self.download_root,
                 )
-                # Validar con un fragmento dummy que no falten dlls (cublas/cudnn)
                 dummy = np.zeros(1600, dtype=np.float32)
                 list(model_cand.transcribe(dummy, beam_size=1)[0])
 
@@ -75,13 +74,13 @@ class SpeechToText:
                     str(e),
                 )
 
-        # Carga en CPU con int8
-        logger.info("Cargando Whisper '%s' en CPU (int8)...", self.model_size)
+        logger.info("Cargando Whisper '%s' en CPU (int8, multi-hilo)...", self.model_size)
         try:
             self.model = WhisperModel(
                 self.model_size,
                 device="cpu",
                 compute_type="int8",
+                cpu_threads=6,  # Acelera la inferencia usando varios núcleos de CPU
                 download_root=self.download_root,
             )
             self.device = "cpu"
@@ -90,28 +89,35 @@ class SpeechToText:
         except Exception as e:
             raise RuntimeError(f"No se pudo cargar el modelo faster-whisper '{self.model_size}': {e}") from e
 
-    def transcribe(self, audio_16k: np.ndarray) -> str:
+    def transcribe(
+        self,
+        audio_16k: np.ndarray,
+        language: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         Transcribe un segmento de audio (16kHz float32 mono).
-        Retorna la transcripción limpia en español.
+        Retorna diccionario con:
+          - text: texto transcripto
+          - elapsed_time: tiempo que demoró Whisper
+          - language: idioma detectado o usado
         """
         if self.model is None:
             raise RuntimeError("El modelo faster-whisper no está cargado.")
 
         if len(audio_16k) == 0:
-            return ""
+            return {"text": "", "elapsed_time": 0.0, "language": ""}
 
-        # Si el audio es silencio puro o energía despreciable, evitar alucinaciones
         rms = float(np.sqrt(np.mean(audio_16k**2)))
         if rms < 0.003:
-            return ""
+            return {"text": "", "elapsed_time": 0.0, "language": ""}
+
+        lang = language if language is not None else self.default_language
+        start_t = time.perf_counter()
 
         try:
-            # Desactivamos vad_filter interno de Whisper porque nuestro VAD externo ya
-            # recortó la frase exacta. Esto evita que Whisper elimine palabras suaves.
-            segments_gen, _ = self.model.transcribe(
+            segments_gen, info = self.model.transcribe(
                 audio_16k,
-                language=self.language,
+                language=lang,
                 beam_size=self.beam_size,
                 temperature=0.0,
                 vad_filter=False,
@@ -119,8 +125,15 @@ class SpeechToText:
             )
 
             parts = [seg.text.strip() for seg in segments_gen if seg.text.strip()]
-            return " ".join(parts).strip()
+            elapsed = time.perf_counter() - start_t
+            detected_lang = info.language if info else lang
+
+            return {
+                "text": " ".join(parts).strip(),
+                "elapsed_time": elapsed,
+                "language": detected_lang,
+            }
 
         except Exception as e:
             logger.error("Error durante la transcripción: %s", e)
-            return ""
+            return {"text": "", "elapsed_time": 0.0, "language": ""}

@@ -1,7 +1,7 @@
 """
 audio_capture.py
-Captura de audio continuo desde el micrófono con remuestreo de alta calidad a 16000 Hz,
-detección de actividad vocal (VAD) y exportación de depuración a WAV.
+Captura continua desde el micrófono con VAD calibrado para baja latencia en tiempo real.
+Corta frases tan pronto hay una pausa natural (~400 ms) y evita acumular retraso.
 """
 
 import os
@@ -18,7 +18,6 @@ import math
 
 logger = logging.getLogger(__name__)
 
-# Palabras clave para excluir dispositivos que no son micrófonos reales de voz
 EXCLUDED_DEVICE_KEYWORDS = [
     "altavoz",
     "speaker",
@@ -33,17 +32,17 @@ EXCLUDED_DEVICE_KEYWORDS = [
 
 
 class AudioCapture:
-    """Captura audio del micrófono a su frecuencia nativa y lo remuestrea limpiamente a 16000 Hz."""
+    """Captura audio del micrófono y detecta fin de oraciones rápidamente sin acumular retraso."""
 
     def __init__(
         self,
         device_index: Optional[int] = None,
         target_sample_rate: int = 16000,
         energy_threshold: float = 0.012,
-        pre_buffer_ms: int = 300,
-        silence_duration_ms: int = 800,
-        min_speech_duration_ms: int = 500,
-        max_speech_duration_ms: int = 12000,
+        pre_buffer_ms: int = 250,
+        silence_duration_ms: int = 400,       # 400ms: corta la frase inmediatamente tras una pausa natural
+        min_speech_duration_ms: int = 400,    # 400ms: descarta carraspeos y chasquidos
+        max_speech_duration_ms: int = 4000,   # 4.0s máximo: nunca acumula más de 4s de habla continua
     ):
         self.target_sample_rate = target_sample_rate
         self.energy_threshold = energy_threshold
@@ -65,16 +64,16 @@ class AudioCapture:
         self.resample_down = self.native_sample_rate // gcd
 
         # Tamaño de bloque de lectura: ~30 ms a la frecuencia nativa
-        self.native_blocksize = int(self.native_sample_rate * 0.030)
-        # Tamaño de bloque resultante tras remuestreo: ~30 ms a 16kHz (480 muestras)
-        self.target_frame_size = int(self.target_sample_rate * 0.030)
+        self.frame_duration_ms = 30.0
+        self.native_blocksize = int(self.native_sample_rate * (self.frame_duration_ms / 1000.0))
 
-        # Cola thread-safe para fragmentos completos de voz
-        # Cada elemento es una tupla: (audio_16k, duracion_seg, nivel_rms)
+        # Cola thread-safe para fragmentos de voz listos
+        # (audio_16k, duracion_seg, nivel_rms)
         self.speech_queue: queue.Queue[Tuple[np.ndarray, float, float]] = queue.Queue()
+        self.capture_error = None
 
-        # Búfer circular de pre-voz (300 ms = 10 frames de 30ms)
-        pre_frames_count = max(1, int(self.pre_buffer_ms / 30))
+        # Búfer circular de pre-voz en frames nativos (250 ms)
+        pre_frames_count = max(1, int(self.pre_buffer_ms / self.frame_duration_ms))
         self.pre_buffer: deque = deque(maxlen=pre_frames_count)
 
         self._stream: Optional[sd.InputStream] = None
@@ -84,7 +83,7 @@ class AudioCapture:
         self._is_speaking = False
         self._current_frames: List[np.ndarray] = []
         self._silence_frames = 0
-        self._total_samples_16k = 0
+        self._total_native_samples = 0
 
     @staticmethod
     def list_microphones() -> List[Dict[str, Any]]:
@@ -99,7 +98,6 @@ class AudioCapture:
                 name = dev.get("name", "")
                 name_lower = name.lower()
 
-                # Descartar salidas, mezclas estéreo y altavoces en loopback
                 if any(kw in name_lower for kw in EXCLUDED_DEVICE_KEYWORDS):
                     continue
 
@@ -135,7 +133,6 @@ class AudioCapture:
             else:
                 raise ValueError(f"ID de micrófono inválido: {requested_id}. El sistema tiene {len(all_devices)} dispositivos.")
 
-        # Si es None, usar el predeterminado del sistema
         default_idx = sd.default.device[0]
         if default_idx >= 0 and default_idx < len(all_devices):
             dev = all_devices[default_idx]
@@ -146,7 +143,6 @@ class AudioCapture:
                 "default_samplerate": dev.get("default_samplerate", 44100.0),
             }
 
-        # Fallback al primer micrófono válido encontrado
         valid_mics = cls.list_microphones()
         if valid_mics:
             return valid_mics[0]
@@ -160,75 +156,79 @@ class AudioCapture:
         time_info: Any,
         status: sd.CallbackFlags,
     ) -> None:
-        """Callback llamado en tiempo real por sounddevice a frecuencia nativa."""
-        if status:
-            logger.debug("Estado de audio: %s", status)
-
-        # 1. Convertir a mono promediando canales (para no perder señal en arrays estéreo)
+        """Callback ultraligero ejecutado por sounddevice a frecuencia nativa."""
+        # 1. Promediar canales estéreo a mono 1D
         if indata.ndim > 1 and indata.shape[1] > 1:
             mono_native = np.mean(indata, axis=1)
         else:
             mono_native = indata.flatten()
 
-        # 2. Remuestrear a 16000 Hz con filtro polifásico de alta fidelidad
-        if self.native_sample_rate != self.target_sample_rate:
-            mono_16k = resample_poly(mono_native, self.resample_up, self.resample_down).astype(np.float32)
-        else:
-            mono_16k = mono_native.astype(np.float32)
-
-        # 3. Calcular nivel RMS para el VAD
-        rms = float(np.sqrt(np.mean(mono_16k**2))) if len(mono_16k) > 0 else 0.0
+        # 2. Calcular nivel RMS en el bloque nativo
+        rms = float(np.sqrt(np.mean(mono_native**2))) if len(mono_native) > 0 else 0.0
         is_speech = rms >= self.energy_threshold
 
-        # 4. Máquina de estados VAD
+        # 3. Máquina de estados de detección de frases
         if not self._is_speaking:
             if is_speech:
-                # Inicio de voz detectado: rescatar el pre-búfer (300 ms)
+                # Comienza a hablar: rescatar el pre-búfer (250 ms)
                 self._is_speaking = True
                 self._current_frames = list(self.pre_buffer)
-                self._current_frames.append(mono_16k)
-                self._total_samples_16k = sum(len(f) for f in self._current_frames)
+                self._current_frames.append(mono_native)
+                self._total_native_samples = sum(len(f) for f in self._current_frames)
                 self._silence_frames = 0
                 self.pre_buffer.clear()
             else:
-                self.pre_buffer.append(mono_16k)
+                self.pre_buffer.append(mono_native)
         else:
-            self._current_frames.append(mono_16k)
-            self._total_samples_16k += len(mono_16k)
+            self._current_frames.append(mono_native)
+            self._total_native_samples += len(mono_native)
 
             if is_speech:
                 self._silence_frames = 0
             else:
                 self._silence_frames += 1
 
-            silence_ms = (self._silence_frames * 30.0)  # Cada frame dura aprox 30ms
-            speech_ms = (self._total_samples_16k / self.target_sample_rate) * 1000.0
+            silence_ms = self._silence_frames * self.frame_duration_ms
+            speech_ms = (self._total_native_samples / self.native_sample_rate) * 1000.0
 
-            # Fin de frase por silencio o por duración máxima
+            # Condición de corte: pausa natural (400ms) o techo de duración (4s)
             if silence_ms >= self.silence_duration_ms or speech_ms >= self.max_speech_duration_ms:
                 if speech_ms >= self.min_speech_duration_ms and self._current_frames:
-                    segment = np.concatenate(self._current_frames)
-                    seg_rms = float(np.sqrt(np.mean(segment**2)))
-                    duration_sec = len(segment) / self.target_sample_rate
+                    raw_segment = np.concatenate(self._current_frames)
 
-                    # Normalización suave de ganancia si el volumen es bajo (sin clipping)
-                    peak = float(np.max(np.abs(segment)))
+                    # Remuestrear el segmento consolidado a 16000 Hz fuera del ciclo frame-a-frame
+                    if self.native_sample_rate != self.target_sample_rate:
+                        segment_16k = resample_poly(
+                            raw_segment, self.resample_up, self.resample_down
+                        ).astype(np.float32)
+                    else:
+                        segment_16k = raw_segment.astype(np.float32)
+
+                    seg_rms = float(np.sqrt(np.mean(segment_16k**2)))
+                    duration_sec = len(segment_16k) / self.target_sample_rate
+
+                    # Normalización suave si el volumen es bajo
+                    peak = float(np.max(np.abs(segment_16k)))
                     if peak > 0.005 and peak < 0.7:
-                        # Amplificar moderadamente hasta un pico de ~0.7
                         gain = min(0.7 / peak, 4.0)
-                        segment = segment * gain
+                        segment_16k = segment_16k * gain
 
-                    self.speech_queue.put((segment, duration_sec, seg_rms))
+                    with self.speech_queue.mutex:
+                        pending = sum(item[1] for item in self.speech_queue.queue)
+                    if pending + duration_sec > 180:
+                        self.capture_error = RuntimeError('Búfer lleno (3 minutos). Captura detenida; se conservan las frases anteriores.')
+                        raise sd.CallbackStop
+                    self.speech_queue.put((segment_16k, duration_sec, seg_rms))
 
                 # Resetear estado
                 self._is_speaking = False
                 self._current_frames = []
                 self._silence_frames = 0
-                self._total_samples_16k = 0
+                self._total_native_samples = 0
                 self.pre_buffer.clear()
 
     def start(self) -> None:
-        """Inicia la captura desde el micrófono a su frecuencia nativa."""
+        """Inicia la captura desde el micrófono."""
         if self._is_recording:
             return
 
@@ -246,7 +246,7 @@ class AudioCapture:
         except Exception as e:
             self._is_recording = False
             raise RuntimeError(
-                f"Error al iniciar captura en el micrófono [ID {self.device_id}] '{self.device_name}': {e}"
+                f"Error al iniciar captura en [ID {self.device_id}] '{self.device_name}': {e}"
             ) from e
 
     def stop(self) -> None:
@@ -262,26 +262,24 @@ class AudioCapture:
                 self._stream = None
 
     def get_speech_segment(self, timeout: float = 0.1) -> Optional[Tuple[np.ndarray, float, float]]:
-        """
-        Retorna (audio_16k, duracion_seg, rms) del siguiente fragmento de voz listo.
-        Retorna None si no hay fragmentos disponibles.
-        """
+        """Retorna el siguiente fragmento de voz listo (audio_16k, duracion_seg, rms)."""
         try:
             return self.speech_queue.get(timeout=timeout)
         except queue.Empty:
+            if self.capture_error:
+                raise self.capture_error
             return None
 
     @staticmethod
     def save_wav(audio_16k: np.ndarray, file_path: str, sample_rate: int = 16000) -> None:
         """Guarda un array float32 de audio como archivo WAV PCM de 16 bits."""
         Path(file_path).parent.mkdir(parents=True, exist_ok=True)
-        # Convertir de float32 [-1.0, 1.0] a int16 [-32768, 32767]
         clipped = np.clip(audio_16k, -1.0, 1.0)
         pcm16 = (clipped * 32767).astype(np.int16)
 
         with wave.open(str(file_path), "wb") as wf:
-            wf.setnchannels(1)  # Mono
-            wf.setsampwidth(2)  # 16 bits (2 bytes)
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
             wf.setframerate(sample_rate)
             wf.writeframes(pcm16.tobytes())
 

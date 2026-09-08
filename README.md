@@ -83,8 +83,11 @@ También se verificó manualmente la captura WASAPI con una frase sintética rep
 por los altavoces y su traducción al español. No se probaron llamadas o servicios de
 streaming específicos ni audio protegido.
 
-La captura usa [WASAPI loopback / PyAudioWPatch](https://github.com/s0d3s/PyAudioWPatch)
-y la traducción usa [Argos Translate](https://argos-translate.readthedocs.io/en/stable/).
+La captura usa [WASAPI loopback / PyAudioWPatch](https://github.com/s0d3s/PyAudioWPatch).
+Inglés → español usa el modelo Marian local cuando está instalado en
+`models/ct2fast-opus-mt-en-es`; las demás rutas usan
+[Argos Translate](https://argos-translate.readthedocs.io/en/stable/), también disponible
+como alternativa si falta Marian. Se mantienen los motores cargados entre sesiones.
 Captura todo el sonido del dispositivo seleccionado, incluidas notificaciones y
 otras aplicaciones. En llamadas captura a quienes escuchás; tu micrófono se puede
 seleccionar por separado, pero esta versión no mezcla ambos dispositivos.
@@ -92,9 +95,31 @@ seleccionar por separado, pero esta versión no mezcla ambos dispositivos.
 Los subtítulos aparecen por fragmentos de hasta unos cuatro segundos más el tiempo
 de reconocimiento y traducción: no son instantáneos. La música, voces superpuestas
 y frases muy cortas pueden reducir la precisión. Si la computadora no alcanza a
-procesar, descarta fragmentos antiguos y muestra el contador de omisiones. Elegí
+procesar, acumula retraso: muestra la demora de la frase y el audio pendiente. Elegí
 el idioma de origen manualmente si la detección automática falla. Algunos contenidos
 protegidos o dispositivos pueden impedir la captura del audio.
+
+Al pulsar **Iniciar**, se abre primero la captura y después se carga Whisper. El audio
+recibido durante la carga queda en memoria y se procesa en orden; ya no se saltan
+frases para alcanzar el video. El búfer admite hasta 180 segundos de audio de voz.
+Si se llena, se detiene la captura con un error explícito y se termina de procesar lo
+ya recibido, sin eliminar frases anteriores. Detener manualmente cancela el trabajo pendiente.
+El audio anterior a abrir la captura no puede recuperarse.
+
+Para reducir la espera inicial, usá **Preparar modelo e idiomas** antes de reproducir
+el video y mantené abierta la aplicación. En CPU, **base** suele ser más rápido;
+**small** puede mejorar reconocimiento a costa de mayor demora. Si se acumula retraso,
+pausar el video permite terminar de procesar el audio pendiente.
+
+Prueba de regresión de inicio (reproduce una frase sintética; requiere voz Windows en inglés):
+
+```powershell
+.\tests\generate_startup_fixture.ps1
+.\.venv\Scripts\python.exe -X utf8 -m tests.regression_startup
+```
+
+Captura audio mientras se simulan 20 segundos de carga y verifica que se conserva
+la primera instrucción y que “Press X to jump” se traduce sin confundir “press” con “prensa”.
 
 Si el entorno `.venv` no arranca, necesitás una instalación funcional de Python 3.10+
 con Tkinter en Windows. Podés crear un entorno nuevo sin borrar el anterior:

@@ -138,14 +138,14 @@ class WhisperEngine:
 
         start_time = time.perf_counter()
 
-        # Configuración de transcripción optimizada para tiempo real
+        # Configuración de transcripción optimizada para tiempo real (ultra baja latencia)
         segments_gen, info = self.model.transcribe(
             audio,
             language=language,
             beam_size=beam_size,
-            vad_filter=True,  # Filtro secundario para descartar ruidos residuales
-            vad_parameters=dict(min_silence_duration_ms=400),
-            condition_on_previous_text=False,  # Evita repetir frases anteriores
+            temperature=0.0,
+            vad_filter=False,  # El VAD externo ya delimitó la frase; evitamos re-filtrar y demorar
+            condition_on_previous_text=False,  # Evita bucles y repeticiones
         )
 
         segments_list = []

@@ -23,7 +23,7 @@ class TranslationTests(unittest.TestCase):
                 calls.append((self.code, target.code))
                 return SimpleNamespace(translate=lambda text: f"{target.code}:{text}")
         module = SimpleNamespace(get_installed_languages=lambda: [Language(c) for c in ('es', 'en', 'pt')])
-        with patch.dict(sys.modules, {'argostranslate.translate': module}):
+        with patch.dict(sys.modules, {'argostranslate.translate': module}), patch.object(LocalTranslator, '_marian_available', return_value=False):
             translator = LocalTranslator()
             for source in ('es', 'en', 'pt'):
                 for target in ('es', 'en', 'pt'):
@@ -31,6 +31,17 @@ class TranslationTests(unittest.TestCase):
                         self.assertEqual(translator.translate('test', source, target), f'{target}:test')
                         translator.translate('again', source, target)
         self.assertEqual(len(calls), 6)
+
+    def test_english_spanish_uses_installed_specialist_and_reuses_it(self):
+        from unittest.mock import Mock
+        backend = Mock()
+        backend.translate_en_to_es.return_value = 'Presiona X'
+        factory = Mock(return_value=backend)
+        with patch.dict(sys.modules, {'translator':SimpleNamespace(LocalTranslator=factory)}), patch.object(LocalTranslator,'_marian_available',return_value=True):
+            translator = LocalTranslator()
+            self.assertEqual(translator.translate('Press X','en','es'),'Presiona X')
+            translator.translate('Press X again','en','es')
+        factory.assert_called_once()
 
     def test_prepared_models_do_not_use_network(self):
         package = SimpleNamespace(get_installed_packages=lambda: [SimpleNamespace(from_code=a, to_code=b) for a,b in PAIRS])
