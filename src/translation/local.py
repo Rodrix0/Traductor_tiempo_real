@@ -30,10 +30,16 @@ def prepare_models(status, stopped):
         package.install_from_path(candidate.download())
 
 
+from src.translation.glossary import SmartGlossary
+from src.translation.context_memory import ContextMemory
+
+
 class LocalTranslator:
-    def __init__(self):
+    def __init__(self, glossary=None, context_turns=5):
         self.routes = {}
         self.english_spanish = None
+        self.glossary = glossary or SmartGlossary()
+        self.context_memory = ContextMemory(max_turns=context_turns)
 
     def _marian_available(self):
         path = ROOT / 'models' / 'ct2fast-opus-mt-en-es'
@@ -48,7 +54,9 @@ class LocalTranslator:
             if self.english_spanish is None:
                 from translator import LocalTranslator as MarianTranslator
                 self.english_spanish = MarianTranslator()
-            return self.english_spanish.translate_en_to_es(text)
+            translated = self.english_spanish.translate_en_to_es(text)
+            self.context_memory.add_turn(text, translated, source, target)
+            return translated
         from argostranslate.translate import get_installed_languages
         key = (source, target)
         if key not in self.routes:
@@ -59,4 +67,26 @@ class LocalTranslator:
             if route is None:
                 raise RuntimeError("Falta esta traducción. Usá «Preparar idiomas».")
             self.routes[key] = route
-        return self.routes[key].translate(text)
+        translated = self.routes[key].translate(text)
+        if self.glossary:
+            translated = self.glossary.apply(translated)
+        self.context_memory.add_turn(text, translated, source, target)
+        return translated
+
+    def clean_source(self, text, source):
+        if source == 'en' and self._marian_available():
+            if self.english_spanish is None:
+                from translator import LocalTranslator as MarianTranslator
+                self.english_spanish = MarianTranslator()
+            if hasattr(self.english_spanish, "clean_english_source"):
+                return self.english_spanish.clean_english_source(text)
+        return text
+
+    def get_whisper_prompt(self):
+        if self._marian_available():
+            if self.english_spanish is None:
+                from translator import LocalTranslator as MarianTranslator
+                self.english_spanish = MarianTranslator()
+            if hasattr(self.english_spanish, "get_whisper_prompt"):
+                return self.english_spanish.get_whisper_prompt()
+        return None

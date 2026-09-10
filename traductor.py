@@ -10,6 +10,7 @@ from src.storage import HistoryStore
 from src.preferences import load_preferences
 from src.ui.settings_panel import SettingsPanel, configure_theme, style_text_widgets
 from src.translation.local import LANGUAGES, LocalTranslator, prepare_models
+from src.subtitles_dialogue import DialogueManager
 
 
 class TranslatorApp(SettingsPanel):
@@ -32,6 +33,7 @@ class TranslatorApp(SettingsPanel):
         self.engine_size = None
         self.translator = LocalTranslator()
         self.overlay = None
+        self.dialogue_manager = DialogueManager()
         self.caption_updated = 0
         self.file_captions = []
         self.file_path = tk.StringVar()
@@ -55,7 +57,7 @@ class TranslatorApp(SettingsPanel):
         row.pack(fill="x")
         self.origin = self.combo(row, "Idioma del audio", ["Automático"] + list(LANGUAGES.values()), 0)
         self.target = self.combo(row, "Traducir a", list(LANGUAGES.values()), 0)
-        self.model = self.combo(row, "Reconocimiento", ["base", "small"], 0)
+        self.model = self.combo(row, "Reconocimiento", ["small.en", "small", "base"], 0)
         row = ttk.Frame(body)
         row.pack(fill="x", pady=15)
         self.prepare = ttk.Button(row, text="Preparar idiomas", command=lambda: self.launch(True))
@@ -82,6 +84,14 @@ class TranslatorApp(SettingsPanel):
         if preferences_warning:
             self.status.set(preferences_warning)
         style_text_widgets(root)
+        from src.ui.hotkeys import bind_local_hotkeys
+        bind_local_hotkeys(
+            root,
+            on_toggle_visibility=self.toggle_overlay,
+            on_toggle_clickthrough=lambda: self.overlay.toggle_click_through() if self.overlay and self.overlay.exists() else None,
+            on_font_increase=lambda: self.overlay.change_font_size(2) if self.overlay and self.overlay.exists() else None,
+            on_font_decrease=lambda: self.overlay.change_font_size(-2) if self.overlay and self.overlay.exists() else None,
+        )
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.after(100, self.poll)
 
@@ -99,7 +109,7 @@ class TranslatorApp(SettingsPanel):
         row.pack(fill="x", pady=8)
         self.file_origin = self.combo(row, "Idioma del audio", ['Automático'] + list(LANGUAGES.values()), 0)
         self.file_target = self.combo(row, "Traducir a", list(LANGUAGES.values()), 0)
-        self.file_model = self.combo(row, "Reconocimiento", ['base', 'small'], 0)
+        self.file_model = self.combo(row, "Reconocimiento", ['small.en', 'small', 'base'], 0)
         row = ttk.Frame(page)
         row.pack(fill="x", pady=12)
         self.process_file = ttk.Button(row, text="Generar subtítulos", command=self.launch_file)
@@ -283,13 +293,15 @@ class TranslatorApp(SettingsPanel):
         reverse = {name: code for code, name in LANGUAGES.items()}
         source_lang = reverse.get(self.origin.get())
         target_lang = reverse[self.target.get()]
-        model_size = self.model.get()
+        from src.asr.manager import sanitize_model_for_language
+        model_size = sanitize_model_for_language(self.model.get(), source_lang)
         device = self.devices[self.source.current()][0] if self.devices else None
         self.stopped.clear()
         self.snapshot_processing()
         if not preparation:
             self.original.set("Esperando audio…")
             self.subtitle.set("Esperando la primera frase…")
+            self.dialogue_manager.clear()
             self.show_overlay()
         for control in self.controls:
             control.configure(state="disabled")
@@ -320,7 +332,13 @@ class TranslatorApp(SettingsPanel):
                 return
             session = self.store.create('Traducción en vivo', 'en vivo', source_lang, target_lang, model_size)
             from src.audio.windows_capture import WindowsCapture
-            self.capture = WindowsCapture(device, threshold=self.active_threshold, chunk_seconds=self.active_chunk)
+            vad_prof = getattr(self.preferences, 'vad_profile', 'natural')
+            self.capture = WindowsCapture(
+                device,
+                threshold=self.active_threshold,
+                chunk_seconds=self.active_chunk,
+                vad_profile=vad_prof,
+            )
             self.capture.start()
             self.emit("status", "Capturando audio. Cargando reconocimiento; las primeras frases quedan en memoria…")
             self.ensure_engine(model_size)
@@ -328,6 +346,7 @@ class TranslatorApp(SettingsPanel):
                 return
             translator = self.translator
             self.emit("status", "Reconocimiento listo. Procesando el audio capturado en orden…")
+            prompt = translator.get_whisper_prompt() if hasattr(translator, "get_whisper_prompt") and source_lang in (None, 'en') else None
             while not self.stopped.is_set():
                 if self.capture.error and self.capture.segments.empty():
                     raise self.capture.error
@@ -336,18 +355,20 @@ class TranslatorApp(SettingsPanel):
                 except queue.Empty:
                     continue
 
-                result = self.engine.transcribe(segment.audio, language=source_lang)
+                result = self.engine.transcribe(segment.audio, language=source_lang, initial_prompt=prompt, vad_filter=False)
                 if not result["text"] or self.stopped.is_set():
                     continue
                 if result["language"] not in LANGUAGES:
                     self.emit("status", "Se detectó otro idioma. Elegí español, inglés o portugués como origen.")
                     continue
-                translated = translator.translate(result["text"], result["language"], target_lang)
+                clean_text = translator.clean_source(result["text"], result["language"]) if hasattr(translator, "clean_source") else result["text"]
+                translated = translator.translate(clean_text, result["language"], target_lang)
                 if not self.stopped.is_set():
-                    self.store.add(session, Caption(segment.start, segment.end, result['text'], translated, result['language']))
-                    self.emit("subtitle", (result["text"], translated, result["language"]))
+                    self.store.add(session, Caption(segment.start, segment.end, clean_text, translated, result['language']))
+                    self.emit("subtitle", (clean_text, translated, result["language"]))
                     delay = max(0, time.monotonic() - segment.captured_at)
-                    self.emit("status", f"{'Captura detenida: procesando el búfer' if self.capture.error else 'Escuchando'} · {LANGUAGES[result['language']]} → {LANGUAGES[target_lang]} · demora: {delay:.1f} s · audio pendiente: {self.capture.pending_seconds:.1f} s")
+                    asr_ms = result.get('elapsed_time', 0.0) * 1000.0
+                    self.emit("status", f"{'Captura detenida: procesando el búfer' if self.capture.error else 'Escuchando'} · {LANGUAGES[result['language']]} → {LANGUAGES[target_lang]} · demora: {delay:.1f} s · ASR: {asr_ms:.0f} ms · audio pendiente: {self.capture.pending_seconds:.1f} s")
         except Exception as exc:
             state = 'error'
             self.emit("error", str(exc))
@@ -378,8 +399,11 @@ class TranslatorApp(SettingsPanel):
                 break
             if kind == "subtitle":
                 original, translated, language = value
-                self.original.set(f"{LANGUAGES[language]}: {original}")
-                self.subtitle.set(translated)
+                self.dialogue_manager.add_turn(original, translated, language)
+                display_trans = self.dialogue_manager.get_display_translated()
+                display_orig = self.dialogue_manager.get_display_original()
+                self.original.set(f"{LANGUAGES[language]}: {display_orig}" if len(self.dialogue_manager.turns) <= 1 else display_orig)
+                self.subtitle.set(display_trans)
                 self.caption_updated = time.monotonic()
                 self.history.configure(state="normal")
                 self.history.insert("end", f"{original}\n→ {translated}\n\n")
@@ -410,11 +434,24 @@ class TranslatorApp(SettingsPanel):
         if self.capture and self.caption_updated and time.monotonic() - self.caption_updated > 15:
             self.subtitle.set("")
             self.original.set("")
+            self.dialogue_manager.clear()
             self.caption_updated = 0
         self.root.after(100, self.poll)
 
+    def toggle_overlay(self):
+        if self.overlay and self.overlay.exists():
+            if self.overlay.window.state() == "withdrawn":
+                self.overlay.window.deiconify()
+                self.overlay.window.lift()
+            else:
+                self.overlay.window.withdraw()
+        else:
+            self.show_overlay()
+
     def show_overlay(self):
         if self.overlay and self.overlay.exists():
+            if self.overlay.window.state() == "withdrawn":
+                self.overlay.window.deiconify()
             self.overlay.window.lift()
             return
         from src.ui.overlay import SubtitleOverlay

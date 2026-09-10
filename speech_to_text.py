@@ -93,6 +93,7 @@ class SpeechToText:
         self,
         audio_16k: np.ndarray,
         language: Optional[str] = None,
+        initial_prompt: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Transcribe un segmento de audio (16kHz float32 mono).
@@ -120,6 +121,7 @@ class SpeechToText:
                 language=lang,
                 beam_size=self.beam_size,
                 temperature=0.0,
+                initial_prompt=initial_prompt,
                 vad_filter=False,
                 condition_on_previous_text=False,
             )

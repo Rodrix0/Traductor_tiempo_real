@@ -11,21 +11,29 @@ class Preferences:
     model: str = 'base'
     compute: str = 'auto'
     device_name: str = ''
-    font_size: int = 24
+    font_size: int = 20
     opacity: float = 0.95
     threshold: float = 0.008
-    chunk_seconds: float = 4.0
+    chunk_seconds: float = 8.0
+    audio_mode: str = 'system'
+    vad_profile: str = 'natural'
 
     def validate(self):
-        for value, allowed in [(self.source, ('auto','es','en','pt')), (self.target, ('es','en','pt')),
-                (self.model, ('base','small')), (self.compute, ('auto','cpu'))]:
+        for value, allowed in [
+            (self.source, ('auto','es','en','pt')),
+            (self.target, ('es','en','pt')),
+            (self.model, ('base','small','small.en','medium')),
+            (self.compute, ('auto','cpu')),
+            (self.audio_mode, ('system','mic','both')),
+            (self.vad_profile, ('fast','balanced','natural')),
+        ]:
             if value not in allowed:
-                raise ValueError('Idioma, modelo o procesamiento no admitido.')
+                raise ValueError('Idioma, modelo, procesamiento, modo de audio o perfil VAD no admitido.')
         if not isinstance(self.device_name, str):
             raise ValueError('Dispositivo inválido.')
         if type(self.font_size) is not int or not 16 <= self.font_size <= 48:
             raise ValueError('El tamaño de subtítulos debe estar entre 16 y 48.')
-        for value, low, high in [(self.opacity,0.45,1), (self.threshold,0.002,0.05), (self.chunk_seconds,2,8)]:
+        for value, low, high in [(self.opacity,0.45,1), (self.threshold,0.002,0.05), (self.chunk_seconds,2,15)]:
             if isinstance(value, bool) or not isinstance(value, (int,float)) or not low <= value <= high:
                 raise ValueError('Opacidad, sensibilidad o duración fuera del rango permitido.')
         return self

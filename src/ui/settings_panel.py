@@ -46,14 +46,15 @@ class SettingsPanel:
         row.pack(fill='x', pady=10)
         self.pref_origin = self.combo(row, 'Idioma del audio', ['Automático'] + list(LANGUAGES.values()), 0)
         self.pref_target = self.combo(row, 'Traducir a', list(LANGUAGES.values()), 0)
-        self.pref_model = self.combo(row, 'Calidad', ['base','small'], 0)
-        ttk.Label(page, text='base: más rápido en CPU. small: mayor precisión y más tiempo de procesamiento.').pack(anchor='w')
+        self.pref_model = self.combo(row, 'Calidad', ['small.en', 'small', 'base'], 0)
+        ttk.Label(page, text='small.en: recomendada para inglés (mayor fidelidad léxica). small: multilingüe. base: ultra-rápido.').pack(anchor='w')
         row = ttk.Frame(page)
         row.pack(fill='x', pady=10)
         self.pref_compute = self.combo(row, 'Procesamiento', ['Automático','CPU'], 0)
+        self.pref_vad_profile = self.combo(row, 'Perfil VAD', ['Natural (800 ms)', 'Equilibrado (550 ms)', 'Rápido (350 ms)'], 0)
         self.pref_device = self.combo(row, 'Dispositivo de audio', [], -1)
-        self.pref_device.configure(width=60)
-        ttk.Label(page, text='Automático intenta usar GPU y recurre a CPU si faltan componentes.').pack(anchor='w')
+        self.pref_device.configure(width=45)
+        ttk.Label(page, text='Automático intenta usar GPU y recurre a CPU si faltan componentes. Perfil VAD define la cadencia de corte.').pack(anchor='w')
         row = ttk.Frame(page)
         row.pack(fill='x', pady=14)
         self.pref_font = self.number_field(row, 'Tamaño de subtítulos (16–48)', 24)
@@ -70,10 +71,11 @@ class SettingsPanel:
         self.prepare_settings = ttk.Button(row, text='Preparar modelo e idiomas', command=self.prepare_from_settings)
         self.prepare_settings.pack(side='left', padx=8)
         ttk.Button(row, text='Ver modelos instalados', command=self.model_inventory).pack(side='left')
+        ttk.Button(row, text='⚡ Diagnóstico y Benchmark', command=self.run_hardware_benchmark).pack(side='left', padx=8)
         self.inventory = tk.StringVar()
         ttk.Label(page, textvariable=self.inventory, wraplength=900).pack(anchor='w', pady=8)
         ttk.Label(page, textvariable=self.status, wraplength=900).pack(anchor='w', pady=8)
-        self.controls.extend([self.pref_origin,self.pref_target,self.pref_model,self.pref_compute,self.pref_device,
+        self.controls.extend([self.pref_origin,self.pref_target,self.pref_model,self.pref_compute,self.pref_vad_profile,self.pref_device,
             self.pref_font,self.pref_opacity,self.pref_threshold,self.pref_chunk,self.save_settings,self.prepare_settings])
         self.model_inventory()
 
@@ -116,6 +118,9 @@ class SettingsPanel:
         for control in (self.model,self.file_model,self.pref_model):
             control.set(p.model)
         self.pref_compute.set('CPU' if p.compute == 'cpu' else 'Automático')
+        vad_display = {'fast': 'Rápido (350 ms)', 'balanced': 'Equilibrado (550 ms)', 'natural': 'Natural (800 ms)'}
+        if hasattr(self, 'pref_vad_profile'):
+            self.pref_vad_profile.set(vad_display.get(getattr(p, 'vad_profile', 'natural'), 'Natural (800 ms)'))
         for control, value in [(self.pref_font,p.font_size),(self.pref_opacity,p.opacity),
                 (self.pref_threshold,p.threshold),(self.pref_chunk,p.chunk_seconds)]:
             control.delete(0,'end')
@@ -132,10 +137,14 @@ class SettingsPanel:
     def save_settings_action(self):
         reverse = {name: code for code,name in LANGUAGES.items()}
         try:
+            vad_map = {'Rápido (350 ms)': 'fast', 'Equilibrado (550 ms)': 'balanced', 'Natural (800 ms)': 'natural'}
+            chosen_vad = vad_map.get(self.pref_vad_profile.get(), 'natural') if hasattr(self, 'pref_vad_profile') else 'natural'
+            audio_mode = getattr(self.preferences, 'audio_mode', 'system')
             preferences = Preferences(source=reverse.get(self.pref_origin.get(),'auto'), target=reverse[self.pref_target.get()],
                 model=self.pref_model.get(), compute='cpu' if self.pref_compute.get()=='CPU' else 'auto',
                 device_name=self.pref_device.get(), font_size=int(self.pref_font.get()),
-                opacity=float(self.pref_opacity.get()), threshold=float(self.pref_threshold.get()), chunk_seconds=float(self.pref_chunk.get()))
+                opacity=float(self.pref_opacity.get()), threshold=float(self.pref_threshold.get()), chunk_seconds=float(self.pref_chunk.get()),
+                audio_mode=audio_mode, vad_profile=chosen_vad)
             save_preferences(self.data_dir/'preferences.json', preferences)
             self.preferences = preferences
             self.apply_preferences()
@@ -161,3 +170,22 @@ class SettingsPanel:
             self.engine = None
             self.engine = WhisperEngine(model_size=model,device=self.active_compute)
             self.engine_size = key
+
+    def run_hardware_benchmark(self):
+        """Ejecuta una prueba rápida de inferencia para medir la latencia real del hardware."""
+        from src.ui.diagnostics import SystemDiagnostics, SystemBenchmark
+        summary = SystemDiagnostics.get_system_summary()
+        self.status.set("Ejecutando diagnóstico de velocidad y latencia de hardware...")
+        if hasattr(self, "root"):
+            self.root.update_idletasks()
+        try:
+            res = SystemBenchmark.run_benchmark(
+                engine=getattr(self, "engine", None),
+                translator=getattr(self, "translator", None),
+            )
+            cuda_txt = f"GPU CUDA ({summary['device_count']} disp.)" if summary["cuda_available"] else "CPU (int8)"
+            report = f"Diagnóstico: {cuda_txt} | ASR: {res['asr_latency_ms']} ms | Trad: {res['trans_latency_ms']} ms | Total: {res['total_latency_ms']} ms"
+            self.status.set(report)
+        except Exception as e:
+            self.status.set(f"Error en diagnóstico: {e}")
+

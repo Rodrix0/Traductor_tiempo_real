@@ -9,6 +9,7 @@ os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
 import time
 import logging
+import re
 from typing import Optional, Dict, Any, List
 import numpy as np
 
@@ -19,11 +20,25 @@ from config.settings import (
     WHISPER_COMPUTE_TYPE,
     BEAM_SIZE,
 )
+from src.asr.base import ASREngine
 
 logger = logging.getLogger(__name__)
 
 
-class WhisperEngine:
+def deduplicate_repetitions(text: str) -> str:
+    """Elimina bucles patológicos de repetición de palabras y frases consecutivas generadas por ASR."""
+    if not text:
+        return ""
+    # 1. Eliminar repeticiones inmediatas de una misma palabra: 'palabra palabra palabra' -> 'palabra'
+    cleaned = re.sub(r'\b(\w+)(?:\s+\1\b)+', r'\1', text, flags=re.IGNORECASE)
+    # 2. Eliminar repetición consecutiva de frases (ej. 'iba a suceder cuando iba a suceder cuando')
+    pattern = r'(\b(?:\w+\s+){1,6}\w+)\s+\1\b'
+    for _ in range(3):
+        cleaned = re.sub(pattern, r'\1', cleaned, flags=re.IGNORECASE)
+    return cleaned.strip()
+
+
+class WhisperEngine(ASREngine):
     """Envoltorio optimizado sobre faster-whisper para transcripción en tiempo real."""
 
     def __init__(
@@ -117,11 +132,26 @@ class WhisperEngine:
         except Exception as e:
             logger.debug("Warmup finalizado: %s", e)
 
+    @property
+    def is_ready(self) -> bool:
+        return self.model is not None
+
+    @property
+    def device(self) -> str:
+        return self.actual_device
+
+    @property
+    def compute_type(self) -> str:
+        return self.actual_compute_type
+
     def transcribe(
         self,
         audio: np.ndarray,
         language: Optional[str] = None,
         beam_size: int = BEAM_SIZE,
+        initial_prompt: Optional[str] = None,
+        vad_filter: Optional[bool] = None,
+        **kwargs
     ) -> Dict[str, Any]:
         """
         Transcribe un array de audio (16kHz float32 mono).
@@ -138,14 +168,23 @@ class WhisperEngine:
 
         start_time = time.perf_counter()
 
-        # Configuración de transcripción optimizada para tiempo real (ultra baja latencia)
+        # Doble VAD protection: si vad_filter es explícitamente False (por segmentación externa),
+        # no usamos vad_filter en Whisper para evitar corte de palabras y latencia innecesaria.
+        use_vad = True if vad_filter is None else bool(vad_filter)
+
+        # Configuración de transcripción optimizada para tiempo real y prevención de alucinaciones
         segments_gen, info = self.model.transcribe(
             audio,
             language=language,
             beam_size=beam_size,
             temperature=0.0,
-            vad_filter=False,  # El VAD externo ya delimitó la frase; evitamos re-filtrar y demorar
-            condition_on_previous_text=False,  # Evita bucles y repeticiones
+            vad_filter=use_vad,
+            condition_on_previous_text=False,  # CRÍTICO: False para evitar bucles infinitos de repetición
+            initial_prompt=initial_prompt,
+            repetition_penalty=1.2,  # Penaliza la repetición de palabras
+            no_repeat_ngram_size=3,  # Prohíbe repetición idéntica de 3-gramas
+            compression_ratio_threshold=2.4,  # Descarta alucinaciones repetitivas
+            hallucination_silence_threshold=2.0,  # Suprime alucinaciones en silencio
         )
 
         segments_list = []
@@ -163,6 +202,7 @@ class WhisperEngine:
 
         elapsed = time.perf_counter() - start_time
         full_text = " ".join(full_text_parts).strip()
+        full_text = deduplicate_repetitions(full_text)
 
         return {
             "text": full_text,

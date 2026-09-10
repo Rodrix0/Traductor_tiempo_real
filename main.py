@@ -1,9 +1,11 @@
 """
 main.py
-Traductor y reconocedor de voz en tiempo real de baja latencia.
-
-Flujo optimizado:
-MICRÓFONO -> VAD RÁPIDO (corte a 400ms) -> FASTER-WHISPER (~0.3s) -> TRADUCTOR LOCAL (~0.1s) -> CONSOLA
+Traductor en tiempo real de ultra baja latencia y alta precisión.
+Incorpora:
+  - Modelo Whisper especializado en inglés (small.en) o multilingüe (small).
+  - Prompts contextuales (initial_prompt) para evitar palabras mal escuchadas.
+  - Motor de traducción Meta NLLB-200 (modismos y lenguaje moderno) o MarianMT.
+  - Glosario personalizable (glossary.json) para calibración exacta de términos.
 """
 
 import sys
@@ -21,26 +23,30 @@ init(autoreset=True)
 # CONFIGURACIÓN PRINCIPAL
 # =====================================================================
 
-# Micrófono a usar:
-# ID 1 suele ser 'Microphone Array (AMD Audio Device)'
-# Pon None para usar el predeterminado de Windows
+# Micrófono a usar (None para usar el predeterminado de Windows)
 MIC_DEVICE_ID = 1
 
-# Idioma en el que habla la persona / el video:
-# "en" = inglés (recomendado si estás viendo videos en inglés)
+# Idioma de entrada del audio/video:
+# "en" = inglés (recomendado para videos en inglés)
 # "es" = español
-# None = detección automática
 INPUT_LANGUAGE = "en"
 
+# Modelo Whisper:
+# "small.en" = Especializado 100% en inglés (máxima precisión léxica y de modismos)
+# "small"    = Multilingüe general
+# "base"     = Velocidad extrema (< 0.2s)
+MODEL_SIZE = "small.en"
+
+# Prompt contextual (None = 100% independiente y autónomo):
+WHISPER_PROMPT = None
+
 # ¿Traducir automáticamente al español al terminar la frase?
-# True = muestra el texto original en inglés y su traducción inmediata en español
-# False = solo muestra el texto transcripto
 ENABLE_TRANSLATION = True
 
-# Modelo Whisper:
-# "small" = excelente precisión (~460MB)
-# "base"  = velocidad extrema sub-segundo (~145MB)
-MODEL_SIZE = "small"
+# Motor de traducción local:
+# "nllb"   = Meta NLLB-200 (Mayor fidelidad en modismos, lenguaje moderno y coloquial)
+# "marian" = Helsinki-NLP MarianMT (Ultra-liviano y veloz, ~150ms)
+TRANSLATION_ENGINE = "nllb"
 
 # Guardar archivos WAV para diagnóstico en debug_audio/
 DEBUG_SAVE_AUDIO = False
@@ -56,9 +62,9 @@ def main():
         except Exception:
             pass
 
-    print(Fore.CYAN + "=" * 65)
-    print(Fore.CYAN + Style.BRIGHT + "   TRADUCTOR EN TIEMPO REAL - MODO ULTRA BAJA LATENCIA")
-    print(Fore.CYAN + "=" * 65)
+    print(Fore.CYAN + "=" * 68)
+    print(Fore.CYAN + Style.BRIGHT + "   TRADUCTOR EN TIEMPO REAL - MODO ALTA PRECISIÓN Y BAJA LATENCIA")
+    print(Fore.CYAN + "=" * 68)
 
     # 1. Resolver micrófono
     mics = AudioCapture.list_microphones()
@@ -79,43 +85,46 @@ def main():
         energy_threshold=0.012,
         pre_buffer_ms=250,
         silence_duration_ms=400,       # Corta a los 400ms de terminar la frase
-        min_speech_duration_ms=400,    # Descarta clics o ruidos menores a 0.4s
-        max_speech_duration_ms=4000,   # Corta cada 4s si el habla es continua
+        min_speech_duration_ms=400,    # Descarta ruidos menores a 0.4s
+        max_speech_duration_ms=4000,   # Máximo 4s para evitar retrasos
     )
 
-    # Capturar antes de cargar modelos; conservar las primeras frases en memoria.
     recorder.start()
+
     try:
-        print(Fore.WHITE + f"\nCapturando audio. Cargando Whisper ('{MODEL_SIZE}'); el inicio queda en memoria...")
-        engine = SpeechToText(model_size=MODEL_SIZE, default_language=INPUT_LANGUAGE, beam_size=1)
+        # 3. Cargar faster-whisper con el modelo especializado
+        print(Fore.WHITE + f"\nCargando motor de reconocimiento Whisper ('{MODEL_SIZE}')...")
+        engine = SpeechToText(
+            model_size=MODEL_SIZE,
+            default_language=None if MODEL_SIZE.endswith(".en") else INPUT_LANGUAGE,
+            beam_size=1,  # Inferencia rápida sin pérdida de precisión en habla clara
+        )
+
+        # 4. Cargar traductor local (NLLB-200 o MarianMT)
         translator = None
         if ENABLE_TRANSLATION and INPUT_LANGUAGE == "en":
-            print(Fore.WHITE + "Cargando traductor local EN -> ES...")
-            translator = LocalTranslator(device="cpu")
-    except BaseException:
-        recorder.stop()
-        raise
+            print(Fore.WHITE + f"Cargando motor de traducción local [{TRANSLATION_ENGINE.upper()}] con glosario...")
+            translator = LocalTranslator(engine=TRANSLATION_ENGINE, device="cpu")
 
-    # 5. Panel informativo
-    print("\n" + Fore.CYAN + "=" * 65)
-    print(Fore.WHITE + f" - Micrófono seleccionado : {Fore.YELLOW}[ID {selected_info['id']}] {selected_info['name']}")
-    print(Fore.WHITE + f" - Idioma de entrada     : {Fore.YELLOW}{INPUT_LANGUAGE.upper() if INPUT_LANGUAGE else 'Autodetección'}")
-    print(Fore.WHITE + f" - Traducción automática : {Fore.GREEN + 'Activada (Inglés -> Español)' if translator else Fore.YELLOW + 'Desactivada'}")
-    print(Fore.WHITE + f" - Modelo Whisper        : {Fore.YELLOW}{MODEL_SIZE} (beam_size=1, multi-hilo)")
-    print(Fore.WHITE + f" - Silencio de corte     : {Fore.YELLOW}400 ms (corte inmediato de oración)")
-    print(Fore.CYAN + "=" * 65)
-    print(Fore.GREEN + Style.BRIGHT + "\nEscuchando continuamente... Reproduce el video o habla.")
-    print(Fore.YELLOW + "Presiona [Ctrl + C] para salir en cualquier momento.\n")
-    print(Fore.CYAN + "-" * 65)
+        # 5. Panel informativo
+        print("\n" + Fore.CYAN + "=" * 68)
+        print(Fore.WHITE + f" - Micrófono seleccionado : {Fore.YELLOW}[ID {selected_info['id']}] {selected_info['name']}")
+        print(Fore.WHITE + f" - Idioma de entrada     : {Fore.YELLOW}{INPUT_LANGUAGE.upper()}")
+        print(Fore.WHITE + f" - Modelo Whisper        : {Fore.YELLOW}{MODEL_SIZE} (con prompt contextual)")
+        print(Fore.WHITE + f" - Motor de traducción   : {Fore.YELLOW}{'Meta NLLB-200 (Alta fidelidad)' if TRANSLATION_ENGINE == 'nllb' else 'MarianMT (Ultra-liviano)'}")
+        print(Fore.WHITE + f" - Términos en glosario  : {Fore.GREEN}{len(translator.glossary) if translator else 0} reglas activas (glossary.json)")
+        print(Fore.WHITE + f" - Silencio de corte VAD : {Fore.YELLOW}400 ms (corte inmediato de frase)")
+        print(Fore.CYAN + "=" * 68)
+        print(Fore.GREEN + Style.BRIGHT + "\nEscuchando continuamente... Reproduce el video o habla.")
+        print(Fore.YELLOW + "Presiona [Ctrl + C] para salir en cualquier momento.\n")
+        print(Fore.CYAN + "-" * 68)
 
-    if DEBUG_SAVE_AUDIO:
-        DEBUG_DIR.mkdir(exist_ok=True)
+        if DEBUG_SAVE_AUDIO:
+            DEBUG_DIR.mkdir(exist_ok=True)
 
-    capture_count = 0
+        capture_count = 0
 
-    try:
         while True:
-            # Esperar el siguiente fragmento de voz
             item = recorder.get_speech_segment(timeout=0.1)
             if item is None:
                 continue
@@ -127,8 +136,15 @@ def main():
                 wav_path = DEBUG_DIR / f"capture_{capture_count:03d}.wav"
                 AudioCapture.save_wav(audio_16k, str(wav_path))
 
-            # Transcribir audio
-            asr_res = engine.transcribe(audio_16k, language=INPUT_LANGUAGE)
+            # Transcribir audio con prompt contextual
+            prompt = WHISPER_PROMPT if INPUT_LANGUAGE == "en" else None
+            lang = None if MODEL_SIZE.endswith(".en") else INPUT_LANGUAGE
+
+            asr_res = engine.transcribe(
+                audio_16k,
+                language=lang,
+                initial_prompt=prompt,
+            )
             original_text = asr_res["text"]
             t_asr = asr_res["elapsed_time"]
 
@@ -137,7 +153,7 @@ def main():
 
             timestamp = time.strftime("%H:%M:%S")
 
-            # Si la traducción está activada y el audio está en inglés
+            # Traducir y mostrar
             if translator is not None:
                 t0_tr = time.perf_counter()
                 trad_text = translator.translate_en_to_es(original_text)
@@ -146,7 +162,7 @@ def main():
 
                 print(
                     f"{Fore.CYAN}[{timestamp}] "
-                    f"{Fore.LIGHTBLACK_EX}[Audio: {duration_sec:.1f}s | Latencia total: {t_total:.2f}s]\n"
+                    f"{Fore.LIGHTBLACK_EX}[Audio: {duration_sec:.1f}s | ASR: {t_asr:.2f}s | Trad: {t_tr:.2f}s | Total: {t_total:.2f}s]\n"
                     f"  {Fore.YELLOW}Original (EN) : {Fore.WHITE}{original_text}\n"
                     f"  {Fore.GREEN}{Style.BRIGHT}Traducción(ES): {Fore.WHITE}{Style.BRIGHT}{trad_text}\n"
                 )

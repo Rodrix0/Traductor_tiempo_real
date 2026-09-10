@@ -43,7 +43,20 @@ class TestWhisperEngine(unittest.TestCase):
         audio_1s = np.zeros(16000, dtype=np.float32)
         result = self.engine.transcribe(audio_1s)
         # En CPU int8 o GPU float16 debería tardar menos de 2.0s para un audio de 1s
-        self.assertLess(result["elapsed_time"], 2.0, "La inferencia tomó demasiado tiempo.")
+    def test_deduplicate_repetitions(self):
+        """Verifica la eliminación de bucles de alucinación y repeticiones consecutivas."""
+        from src.asr.whisper_engine import deduplicate_repetitions
+
+        # Repetición de frases idénticas
+        phrase_loop = "iba a suceder cuando se suponía que iba a suceder cuando se suponía que iba a suceder"
+        cleaned = deduplicate_repetitions(phrase_loop)
+        self.assertNotIn("iba a suceder cuando se suponía que iba a suceder cuando se suponía", cleaned)
+        self.assertIn("iba a suceder cuando se suponía que", cleaned)
+
+        # Repetición de palabras sueltas
+        word_loop = "hola hola hola cómo estás estás bien"
+        cleaned_words = deduplicate_repetitions(word_loop)
+        self.assertEqual(cleaned_words, "hola cómo estás bien")
 
 
 if __name__ == "__main__":

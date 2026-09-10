@@ -4,7 +4,7 @@ Agrupa frames de audio en frases completas detectando el inicio de voz y los sil
 """
 
 from collections import deque
-from typing import Optional, List
+from typing import Optional, List, Union
 import numpy as np
 
 from config.settings import (
@@ -15,6 +15,7 @@ from config.settings import (
     MAX_SPEECH_DURATION_MS,
     PRE_SPEECH_PADDING_MS,
 )
+from src.pipeline.models import VADProfile
 
 
 class VoiceActivityDetector:
@@ -27,18 +28,26 @@ class VoiceActivityDetector:
         self,
         sample_rate: int = SAMPLE_RATE,
         energy_threshold: float = ENERGY_THRESHOLD,
-        silence_duration_ms: int = SILENCE_DURATION_MS,
+        silence_duration_ms: Optional[int] = None,
         min_speech_duration_ms: int = MIN_SPEECH_DURATION_MS,
         max_speech_duration_ms: int = MAX_SPEECH_DURATION_MS,
         pre_speech_padding_ms: int = PRE_SPEECH_PADDING_MS,
+        profile: Optional[Union[VADProfile, str]] = None,
     ):
         self.sample_rate = sample_rate
         self.energy_threshold = energy_threshold
-        self.silence_duration_ms = silence_duration_ms
+
+        if profile is not None:
+            self.profile = VADProfile(profile)
+            self.silence_duration_ms = self.profile.silence_duration_ms
+        else:
+            self.profile = VADProfile.NATURAL
+            self.silence_duration_ms = silence_duration_ms if silence_duration_ms is not None else SILENCE_DURATION_MS
+
         self.min_speech_duration_ms = min_speech_duration_ms
         self.max_speech_duration_ms = max_speech_duration_ms
 
-        # Buffer circular para conservar audio inmediatamente anterior al inicio de voz
+        # Buffer circular para conservar audio inmediatamente anterior al inicio de voz (pre-roll 200-300ms)
         # evitando cortar la primera sílaba
         pre_speech_samples = int(sample_rate * (pre_speech_padding_ms / 1000.0))
         self.pre_speech_buffer: deque = deque(maxlen=max(1, pre_speech_samples // 480))
@@ -99,12 +108,41 @@ class VoiceActivityDetector:
         if silence_ms >= self.silence_duration_ms:
             return self._finalize_speech_segment(speech_ms)
 
-        # Caso B: El usuario habló continuamente durante mucho tiempo (ej. > 12s)
-        # Forzar corte para no generar latencias excesivas
+        # Caso B: El usuario habló continuamente durante mucho tiempo
+        # Cortar de forma inteligente en el valle de menor energía para no cortar palabras
         if speech_ms >= self.max_speech_duration_ms:
-            return self._finalize_speech_segment(speech_ms)
+            return self._split_at_energy_valley()
 
         return None
+
+    def _split_at_energy_valley(self) -> Optional[np.ndarray]:
+        """Corta de forma inteligente en el punto de menor energía (valle) para no cortar palabras."""
+        if not self.current_speech_frames:
+            return None
+
+        total_frames = len(self.current_speech_frames)
+        frame_len = len(self.current_speech_frames[0]) if total_frames > 0 else 480
+        search_window = min(int((1.5 * self.sample_rate) / frame_len), max(2, total_frames // 2))
+
+        if total_frames < 4 or search_window < 2:
+            return self._finalize_speech_segment((self.speech_samples_count / self.sample_rate) * 1000.0)
+
+        start_idx = total_frames - search_window
+        energies = [self.calculate_energy(f) for f in self.current_speech_frames[start_idx:]]
+        min_idx = int(np.argmin(energies))
+        split_point = start_idx + min_idx + 1
+
+        emitted_frames = self.current_speech_frames[:split_point]
+        remaining_frames = self.current_speech_frames[split_point:]
+
+        audio_segment = np.concatenate(emitted_frames) if emitted_frames else None
+
+        # Mantener los frames restantes como inicio del siguiente fragmento para continuidad
+        self.current_speech_frames = remaining_frames
+        self.speech_samples_count = sum(len(f) for f in remaining_frames)
+        self.silence_samples_count = 0
+
+        return audio_segment
 
     def _finalize_speech_segment(self, speech_ms: float) -> Optional[np.ndarray]:
         """Finaliza y resetea el segmento actual de voz."""
@@ -128,3 +166,11 @@ class VoiceActivityDetector:
         self.pre_speech_buffer.clear()
         self.speech_samples_count = 0
         self.silence_samples_count = 0
+
+    def set_profile(self, profile: Union[VADProfile, str]) -> None:
+        """Cambia dinámicamente el perfil VAD y actualiza la ventana de silencio."""
+        self.profile = VADProfile(profile) if isinstance(profile, str) else profile
+        self.silence_duration_ms = self.profile.silence_duration_ms
+
+    process_chunk = process_frame
+
