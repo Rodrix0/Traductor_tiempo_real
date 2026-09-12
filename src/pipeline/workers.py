@@ -9,7 +9,7 @@ import threading
 import queue
 import time
 import logging
-from typing import Optional, Callable, Any, TYPE_CHECKING
+from typing import Optional, Callable, Any, TYPE_CHECKING, List, Tuple
 import numpy as np
 
 from src.pipeline.models import (
@@ -40,6 +40,8 @@ class VADWorker(threading.Thread):
         vad: Any,
         stop_event: threading.Event,
         session_id: Optional[str] = None,
+        overlap_detector: Optional[Any] = None,
+        separation_queue: Optional[queue.Queue] = None,
     ):
         super().__init__(daemon=True, name="VADWorkerThread")
         self.audio_queue = audio_queue
@@ -47,6 +49,8 @@ class VADWorker(threading.Thread):
         self.vad = vad
         self.stop_event = stop_event
         self.session_id = session_id
+        self.overlap_detector = overlap_detector
+        self.separation_queue = separation_queue
         self._seq_counter = 0
 
     def run(self) -> None:
@@ -79,6 +83,20 @@ class VADWorker(threading.Thread):
                         external_vad_processed=True,  # Para suprimir VAD redundante en ASR
                     )
 
+                    # Detección inteligente de habla simultánea (VOZ + VOZ)
+                    if self.overlap_detector and self.separation_queue is not None:
+                        try:
+                            overlap_res = self.overlap_detector.detect(segment_audio, base_start_time=0.0)
+                            if overlap_res.has_overlap:
+                                speech_segment.is_overlap = True
+                                try:
+                                    self.separation_queue.put(speech_segment, timeout=1.0)
+                                    continue
+                                except queue.Full:
+                                    logger.warning("Cola de separación llena. Enrutando a ASR normal.")
+                        except Exception as oe:
+                            logger.warning("Error en detector de overlap: %s", oe)
+
                     try:
                         self.speech_queue.put(speech_segment, timeout=1.0)
                     except queue.Full:
@@ -90,6 +108,105 @@ class VADWorker(threading.Thread):
                 self.audio_queue.task_done()
 
         logger.info("VADWorker finalizado.")
+
+
+class SeparationWorker(threading.Thread):
+    """
+    Consume SpeechSegments detectados con habla solapada (is_overlap=True),
+    extrae el contexto con pre-roll/post-roll y ejecuta la separación física en 2 fuentes de audio.
+    Despacha cada fuente separada a speech_queue como un SpeechSegment independiente.
+    """
+
+    def __init__(
+        self,
+        separation_queue: queue.Queue,
+        speech_queue: queue.Queue,
+        separator_manager: Any,
+        stop_event: threading.Event,
+        speaker_tracker: Optional[Any] = None,
+    ):
+        super().__init__(daemon=True, name="SeparationWorkerThread")
+        self.separation_queue = separation_queue
+        self.speech_queue = speech_queue
+        self.separator_manager = separator_manager
+        self.stop_event = stop_event
+        self.speaker_tracker = speaker_tracker
+        from src.separation.validator import SeparationValidator
+        self.validator = SeparationValidator(sample_rate=16000)
+
+    def run(self) -> None:
+        logger.info("SeparationWorker iniciado.")
+        while not self.stop_event.is_set():
+            try:
+                segment: SpeechSegment = self.separation_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            try:
+                # Separar físicamente la mezcla en dos señales de audio
+                sources, failed = self.separator_manager.separate(
+                    segment.audio,
+                    sample_rate=segment.sample_rate,
+                    start_time=segment.start_time,
+                )
+
+                if failed or len(sources) <= 1:
+                    # Fallback seguro: enviar segmento original a ASR sin separar
+                    segment.is_overlap = False
+                    self.speech_queue.put(segment, timeout=1.0)
+                    continue
+
+                # Validación acústica: comprobar si las salidas no son la misma voz dominante
+                val_res = self.validator.validate(sources[0].audio, sources[1].audio, original_audio=segment.audio)
+                if not val_res.is_valid_two_speakers:
+                    logger.info("SeparationWorker: Separación rechazada (%s). Fallback a voz única.", val_res.reason)
+                    segment.is_overlap = False
+                    self.speech_queue.put(segment, timeout=1.0)
+                    continue
+
+                # Pre-asignación con SpeakerTracker para resolver permutación
+                speaker_map = {}
+                if self.speaker_tracker:
+                    try:
+                        assignments = self.speaker_tracker.assign_sources(sources)
+                        for a in assignments:
+                            speaker_map[a.source_id] = a.speaker_id
+                    except Exception as te:
+                        logger.warning("Error en SpeakerTracker durante asignación: %s", te)
+
+                # Despachar cada fuente separada de forma independiente a la cola de ASR
+                for idx, src in enumerate(sources):
+                    spk_id = speaker_map.get(src.source_id, f"SPEAKER_{idx + 1:02d}")
+                    sub_seg = SpeechSegment(
+                        sequence_id=segment.sequence_id,
+                        session_id=segment.session_id,
+                        audio=src.audio,
+                        start_time=src.start_time,
+                        end_time=src.end_time,
+                        captured_at=segment.captured_at,
+                        sample_rate=src.sample_rate,
+                        vad_latency=segment.vad_latency,
+                        external_vad_processed=True,
+                        is_overlap=True,
+                        source_id=src.source_id,
+                        speaker_id=spk_id,
+                    )
+                    try:
+                        self.speech_queue.put(sub_seg, timeout=1.0)
+                    except queue.Full:
+                        logger.warning("Cola de ASR llena durante separación. Descartando fuente %s", src.source_id)
+
+            except Exception as e:
+                logger.error("Error en SeparationWorker para segmento #%d: %s", segment.sequence_id, e, exc_info=True)
+                try:
+                    segment.is_overlap = False
+                    self.speech_queue.put(segment, timeout=1.0)
+                except Exception:
+                    pass
+            finally:
+                self.separation_queue.task_done()
+
+        logger.info("SeparationWorker finalizado.")
 
 
 class ASRWorker(threading.Thread):
@@ -107,6 +224,7 @@ class ASRWorker(threading.Thread):
         source_language: Optional[str] = None,
         beam_size: int = 1,
         initial_prompt: Optional[str] = None,
+        speaker_tracker: Optional[Any] = None,
     ):
         super().__init__(daemon=True, name="ASRWorkerThread")
         self.speech_queue = speech_queue
@@ -116,6 +234,7 @@ class ASRWorker(threading.Thread):
         self.source_language = source_language
         self.beam_size = beam_size
         self.initial_prompt = initial_prompt
+        self.speaker_tracker = speaker_tracker
 
     def run(self) -> None:
         logger.info("ASRWorker iniciado.")
@@ -135,6 +254,22 @@ class ASRWorker(threading.Thread):
                 )
 
                 if transcript.text:
+                    # Determinar o respetar identidad de hablante
+                    speaker_id = segment.speaker_id
+                    if not speaker_id:
+                        if self.speaker_tracker:
+                            try:
+                                dur = segment.end_time - segment.start_time
+                                speaker_id = self.speaker_tracker.register_solo_speech(segment.audio, duration=dur)
+                            except Exception:
+                                speaker_id = "SPEAKER_01"
+                        else:
+                            speaker_id = "SPEAKER_01"
+
+                    transcript.speaker_id = speaker_id
+                    transcript.source_id = segment.source_id
+                    transcript.is_overlap = segment.is_overlap
+
                     try:
                         self.transcript_queue.put(transcript, timeout=1.0)
                     except queue.Full:
@@ -167,6 +302,9 @@ class TranslationWorker(threading.Thread):
         self.translator = translator
         self.stop_event = stop_event
         self.target_language = target_language
+        from src.speakers.duplicate_resolver import DuplicateTranscriptResolver
+        self.duplicate_resolver = DuplicateTranscriptResolver()
+        self._recent_transcripts: List[Tuple[float, str, str]] = []
 
     def run(self) -> None:
         logger.info("TranslationWorker iniciado.")
@@ -181,6 +319,22 @@ class TranslationWorker(threading.Thread):
                 src_lang = transcript.language or "en"
                 tgt_lang = self.target_language or "es"
                 orig_text = transcript.text
+
+                # Detección y supresión de transcripciones duplicadas entre canales
+                now_t = time.monotonic()
+                self._recent_transcripts = [(t, txt, s) for t, txt, s in self._recent_transcripts if now_t - t < 2.5]
+                is_dup = False
+                for prev_t, prev_txt, prev_spk in self._recent_transcripts:
+                    sim = self.duplicate_resolver.calculate_similarity(orig_text, prev_txt)
+                    if sim >= 0.75:
+                        logger.info("TranslationWorker: Duplicado suprimido ('%s' vs '%s', sim=%.2f)", orig_text[:35], prev_txt[:35], sim)
+                        is_dup = True
+                        break
+
+                if is_dup:
+                    continue
+
+                self._recent_transcripts.append((now_t, orig_text, transcript.speaker_id))
 
                 # Si el idioma origen coincide con el destino, o no hay traductor, conservar original
                 if src_lang == tgt_lang or self.translator is None:
@@ -210,6 +364,10 @@ class TranslationWorker(threading.Thread):
                     asr_duration=transcript.asr_duration,
                     translation_start_time=t0,
                     translation_duration=trans_duration,
+                    start_time=transcript.start_time,
+                    end_time=transcript.end_time,
+                    speaker_id=transcript.speaker_id,
+                    is_overlap=transcript.is_overlap,
                 )
 
                 try:
@@ -262,12 +420,14 @@ class SubtitleDispatcherWorker(threading.Thread):
                     translated=trans.translated_text,
                     source_language=trans.source_language,
                     target_language=trans.target_language,
-                    start_time=0.0,
-                    end_time=0.0,
+                    start_time=trans.start_time,
+                    end_time=trans.end_time,
                     total_latency=total_latency,
                     asr_latency=trans.asr_duration,
                     trans_latency=trans.translation_duration,
                     created_at=now,
+                    speaker_id=trans.speaker_id,
+                    is_overlap=trans.is_overlap,
                 )
 
                 try:

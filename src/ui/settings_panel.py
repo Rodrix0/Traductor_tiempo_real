@@ -57,7 +57,8 @@ class SettingsPanel:
         ttk.Label(page, text='Automático intenta usar GPU y recurre a CPU si faltan componentes. Perfil VAD define la cadencia de corte.').pack(anchor='w')
         row = ttk.Frame(page)
         row.pack(fill='x', pady=14)
-        self.pref_font = self.number_field(row, 'Tamaño de subtítulos (16–48)', 24)
+        self.pref_separation = self.combo(row, 'Separación de voces', ['Automático', 'Desactivado', 'Siempre'], 0)
+        self.pref_font = self.number_field(row, 'Tamaño de subtítulos (16–48)', 20)
         self.pref_opacity = self.number_field(row, 'Opacidad (0.45–1)', 0.95)
         row = ttk.Frame(page)
         row.pack(fill='x', pady=8)
@@ -75,7 +76,7 @@ class SettingsPanel:
         self.inventory = tk.StringVar()
         ttk.Label(page, textvariable=self.inventory, wraplength=900).pack(anchor='w', pady=8)
         ttk.Label(page, textvariable=self.status, wraplength=900).pack(anchor='w', pady=8)
-        self.controls.extend([self.pref_origin,self.pref_target,self.pref_model,self.pref_compute,self.pref_vad_profile,self.pref_device,
+        self.controls.extend([self.pref_origin,self.pref_target,self.pref_model,self.pref_compute,self.pref_vad_profile,self.pref_separation,self.pref_device,
             self.pref_font,self.pref_opacity,self.pref_threshold,self.pref_chunk,self.save_settings,self.prepare_settings])
         self.model_inventory()
 
@@ -121,6 +122,9 @@ class SettingsPanel:
         vad_display = {'fast': 'Rápido (350 ms)', 'balanced': 'Equilibrado (550 ms)', 'natural': 'Natural (800 ms)'}
         if hasattr(self, 'pref_vad_profile'):
             self.pref_vad_profile.set(vad_display.get(getattr(p, 'vad_profile', 'natural'), 'Natural (800 ms)'))
+        sep_display = {'auto': 'Automático', 'disabled': 'Desactivado', 'spectral': 'Siempre'}
+        if hasattr(self, 'pref_separation'):
+            self.pref_separation.set(sep_display.get(getattr(p, 'separation_mode', 'auto'), 'Automático'))
         for control, value in [(self.pref_font,p.font_size),(self.pref_opacity,p.opacity),
                 (self.pref_threshold,p.threshold),(self.pref_chunk,p.chunk_seconds)]:
             control.delete(0,'end')
@@ -139,12 +143,14 @@ class SettingsPanel:
         try:
             vad_map = {'Rápido (350 ms)': 'fast', 'Equilibrado (550 ms)': 'balanced', 'Natural (800 ms)': 'natural'}
             chosen_vad = vad_map.get(self.pref_vad_profile.get(), 'natural') if hasattr(self, 'pref_vad_profile') else 'natural'
+            sep_map = {'Automático': 'auto', 'Desactivado': 'disabled', 'Siempre': 'spectral'}
+            chosen_sep = sep_map.get(self.pref_separation.get(), 'auto') if hasattr(self, 'pref_separation') else 'auto'
             audio_mode = getattr(self.preferences, 'audio_mode', 'system')
             preferences = Preferences(source=reverse.get(self.pref_origin.get(),'auto'), target=reverse[self.pref_target.get()],
                 model=self.pref_model.get(), compute='cpu' if self.pref_compute.get()=='CPU' else 'auto',
                 device_name=self.pref_device.get(), font_size=int(self.pref_font.get()),
                 opacity=float(self.pref_opacity.get()), threshold=float(self.pref_threshold.get()), chunk_seconds=float(self.pref_chunk.get()),
-                audio_mode=audio_mode, vad_profile=chosen_vad)
+                audio_mode=audio_mode, vad_profile=chosen_vad, separation_mode=chosen_sep)
             save_preferences(self.data_dir/'preferences.json', preferences)
             self.preferences = preferences
             self.apply_preferences()

@@ -52,6 +52,17 @@ class SpeechSegment:
     sample_rate: int = 16000
     vad_latency: float = 0.0
     external_vad_processed: bool = True  # Marca para evitar Doble VAD en Whisper
+    is_overlap: bool = False
+    source_id: Optional[str] = None
+    speaker_id: Optional[str] = None
+
+    @property
+    def start(self) -> float:
+        return self.start_time
+
+    @property
+    def end(self) -> float:
+        return self.end_time
 
 
 @dataclass
@@ -68,6 +79,18 @@ class TranscriptResult:
     asr_start_time: float
     asr_duration: float
     engine_name: str = "faster-whisper"
+    speaker_id: str = "SPEAKER_01"
+    source_id: Optional[str] = None
+    is_overlap: bool = False
+    is_final: bool = True
+
+    @property
+    def start(self) -> float:
+        return self.start_time
+
+    @property
+    def end(self) -> float:
+        return self.end_time
 
 
 @dataclass
@@ -83,8 +106,20 @@ class TranslationResult:
     asr_duration: float
     translation_start_time: float
     translation_duration: float
+    start_time: float = 0.0
+    end_time: float = 0.0
     provider_name: str = "nllb"
     is_partial: bool = False
+    speaker_id: str = "SPEAKER_01"
+    is_overlap: bool = False
+
+    @property
+    def start(self) -> float:
+        return self.start_time
+
+    @property
+    def end(self) -> float:
+        return self.end_time
 
 
 @dataclass
@@ -101,6 +136,16 @@ class SubtitleItem:
     asr_latency: float
     trans_latency: float
     created_at: float = field(default_factory=time.monotonic)
+    speaker_id: str = "SPEAKER_01"
+    is_overlap: bool = False
+
+    @property
+    def start(self) -> float:
+        return self.start_time
+
+    @property
+    def end(self) -> float:
+        return self.end_time
 
 
 @dataclass
@@ -111,6 +156,7 @@ class PipelineMetrics:
     speech_queue_size: int = 0
     transcript_queue_size: int = 0
     subtitle_queue_size: int = 0
+    separation_queue_size: int = 0
     dropped_frames: int = 0
     total_segments_processed: int = 0
     last_asr_latency_ms: float = 0.0
@@ -123,3 +169,9 @@ class PipelineMetrics:
     current_vad_profile: str = "natural"
     current_asr_model: str = "small"
     current_device: str = "cpu"
+    overlap_segments_detected: int = 0
+    overlap_total_duration: float = 0.0
+    separation_failures: int = 0
+    speaker_swaps_corrected: int = 0
+    active_speakers_count: int = 1
+

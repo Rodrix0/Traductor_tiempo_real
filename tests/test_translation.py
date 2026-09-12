@@ -49,6 +49,17 @@ class TranslationTests(unittest.TestCase):
         with patch.dict(sys.modules, {'argostranslate': parent, 'argostranslate.package': package}):
             prepare_models(lambda _: None, threading.Event())
 
+    def test_marian_clean_translations_without_hallucinations(self):
+        """
+        Verifica que expresiones cortas en inglés se traduzcan de manera limpia y natural
+        sin prefijos espurios de diálogo ni alucinaciones como '- ¿Qué?'.
+        """
+        translator = LocalTranslator()
+        if translator._marian_available():
+            self.assertEqual(translator.translate("Again.", "en", "es"), "Otra vez.")
+            self.assertEqual(translator.translate("3 hour.", "en", "es"), "3 horas.")
+            self.assertEqual(translator.translate("Hello.", "en", "es"), "Hola.")
+
 
 if __name__ == '__main__':
     unittest.main()

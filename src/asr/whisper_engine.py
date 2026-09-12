@@ -172,6 +172,13 @@ class WhisperEngine(ASREngine):
         # no usamos vad_filter en Whisper para evitar corte de palabras y latencia innecesaria.
         use_vad = True if vad_filter is None else bool(vad_filter)
 
+        # Normalización preventiva de audio tenue (micrófono físico o voz lejana)
+        if len(audio) > 0:
+            peak = float(np.max(np.abs(audio)))
+            if 0.001 < peak < 0.25:
+                gain = min(5.0, 0.60 / peak)
+                audio = np.clip(audio * gain, -1.0, 1.0).astype(np.float32)
+
         # Configuración de transcripción optimizada para tiempo real y prevención de alucinaciones
         segments_gen, info = self.model.transcribe(
             audio,

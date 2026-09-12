@@ -17,6 +17,7 @@ class Preferences:
     chunk_seconds: float = 8.0
     audio_mode: str = 'system'
     vad_profile: str = 'natural'
+    separation_mode: str = 'auto'
 
     def validate(self):
         for value, allowed in [
@@ -26,6 +27,7 @@ class Preferences:
             (self.compute, ('auto','cpu')),
             (self.audio_mode, ('system','mic','both')),
             (self.vad_profile, ('fast','balanced','natural')),
+            (self.separation_mode, ('auto','disabled','spectral','mossformer','sepformer')),
         ]:
             if value not in allowed:
                 raise ValueError('Idioma, modelo, procesamiento, modo de audio o perfil VAD no admitido.')

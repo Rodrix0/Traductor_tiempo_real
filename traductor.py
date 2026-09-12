@@ -1,4 +1,5 @@
 """Desktop entry point for automatic translated subtitles on Windows."""
+import logging
 import queue
 import threading
 import time
@@ -12,9 +13,17 @@ from src.ui.settings_panel import SettingsPanel, configure_theme, style_text_wid
 from src.translation.local import LANGUAGES, LocalTranslator, prepare_models
 from src.subtitles_dialogue import DialogueManager
 
+logger = logging.getLogger(__name__)
+
 
 class TranslatorApp(SettingsPanel):
     def __init__(self, root, data_dir=None):
+        if not logging.getLogger().handlers:
+            logging.basicConfig(
+                level=logging.INFO,
+                format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+                datefmt="%H:%M:%S",
+            )
         self.root = root
         self.data_dir = Path(data_dir) if data_dir else Path(__file__).resolve().parent / 'data'
         self.store = HistoryStore(self.data_dir / 'history.sqlite3')
@@ -332,7 +341,10 @@ class TranslatorApp(SettingsPanel):
                 return
             session = self.store.create('Traducción en vivo', 'en vivo', source_lang, target_lang, model_size)
             from src.audio.windows_capture import WindowsCapture
+
             vad_prof = getattr(self.preferences, 'vad_profile', 'natural')
+            sep_mode = getattr(self.preferences, 'separation_mode', 'auto')
+
             self.capture = WindowsCapture(
                 device,
                 threshold=self.active_threshold,
@@ -347,6 +359,18 @@ class TranslatorApp(SettingsPanel):
             translator = self.translator
             self.emit("status", "Reconocimiento listo. Procesando el audio capturado en orden…")
             prompt = translator.get_whisper_prompt() if hasattr(translator, "get_whisper_prompt") and source_lang in (None, 'en') else None
+
+            from src.speakers.overlap_detector import OverlapDetector
+            from src.separation.manager import SpeechSeparatorManager
+            from src.separation.validator import SeparationValidator
+            from src.speakers.tracker import SpeakerTracker
+            from src.speakers.duplicate_resolver import DuplicateTranscriptResolver
+
+            overlap_detector = OverlapDetector(sample_rate=16000)
+            separator_manager = SpeechSeparatorManager(mode=sep_mode, sample_rate=16000)
+            separation_validator = SeparationValidator(sample_rate=16000)
+            speaker_tracker = SpeakerTracker(sample_rate=16000)
+            duplicate_resolver = DuplicateTranscriptResolver()
             while not self.stopped.is_set():
                 if self.capture.error and self.capture.segments.empty():
                     raise self.capture.error
@@ -355,6 +379,60 @@ class TranslatorApp(SettingsPanel):
                 except queue.Empty:
                     continue
 
+                # Detección de habla simultánea (2 personas hablando al mismo tiempo)
+                has_overlap = False
+                if sep_mode != 'disabled' and len(segment.audio) >= 800:
+                    try:
+                        overlap_res = overlap_detector.detect(segment.audio, segment.start)
+                        has_overlap = overlap_res.has_overlap
+                    except Exception:
+                        has_overlap = False
+
+                if has_overlap:
+                    try:
+                        sources, failed = separator_manager.separate(segment.audio, sample_rate=16000, start_time=segment.start)
+                        if not failed and len(sources) >= 2:
+                            # Capa 1: Validación acústica multi-métrica (evita duplicación de voz dominante)
+                            val_res = separation_validator.validate(sources[0].audio, sources[1].audio, original_audio=segment.audio)
+                            if val_res.is_valid_two_speakers:
+                                assignments = speaker_tracker.assign_sources(sources)
+                                raw_transcripts = []
+                                for src, assign in zip(sources, assignments):
+                                    res = self.engine.transcribe(src.audio, language=source_lang, initial_prompt=prompt, vad_filter=False)
+                                    if not res["text"] or self.stopped.is_set():
+                                        continue
+                                    if res["language"] not in LANGUAGES:
+                                        continue
+                                    raw_transcripts.append({
+                                        "src": src,
+                                        "assign": assign,
+                                        "text": res["text"],
+                                        "language": res["language"],
+                                        "confidence": res.get("confidence", 0.9),
+                                        "start_time": src.start_time,
+                                        "end_time": src.end_time,
+                                        "speaker_id": assign.speaker_id,
+                                    })
+
+                                # Capa 3: Reconciliación y deduplicación post-ASR
+                                resolved = duplicate_resolver.resolve(raw_transcripts)
+                                if resolved:
+                                    is_multi = len(resolved) > 1
+                                    for item in resolved:
+                                        clean = translator.clean_source(item["text"], item["language"]) if hasattr(translator, "clean_source") else item["text"]
+                                        trans = translator.translate(clean, item["language"], target_lang)
+                                        if not self.stopped.is_set():
+                                            self.store.add(session, Caption(item["start_time"], item["end_time"], clean, trans, item["language"], speaker_id=item["speaker_id"]))
+                                            self.emit("subtitle", (clean, trans, item["language"], item["speaker_id"], is_multi))
+                                    continue
+                            else:
+                                # Fallback acústico: el validador determinó que ambas salidas son la misma voz
+                                logger.info("Separación acústica rechazada (%s). Fallback a voz individual.", val_res.reason)
+                    except Exception as sep_exc:
+                        logger.warning("Error durante procesamiento de separación/diarización: %s. Fallback a voz individual.", sep_exc, exc_info=True)
+
+                # Flujo normal para una sola persona hablando
+                spk_id = speaker_tracker.register_solo_speech(segment.audio, duration=segment.end - segment.start)
                 result = self.engine.transcribe(segment.audio, language=source_lang, initial_prompt=prompt, vad_filter=False)
                 if not result["text"] or self.stopped.is_set():
                     continue
@@ -364,13 +442,14 @@ class TranslatorApp(SettingsPanel):
                 clean_text = translator.clean_source(result["text"], result["language"]) if hasattr(translator, "clean_source") else result["text"]
                 translated = translator.translate(clean_text, result["language"], target_lang)
                 if not self.stopped.is_set():
-                    self.store.add(session, Caption(segment.start, segment.end, clean_text, translated, result['language']))
-                    self.emit("subtitle", (clean_text, translated, result["language"]))
+                    self.store.add(session, Caption(segment.start, segment.end, clean_text, translated, result['language'], speaker_id=spk_id))
+                    self.emit("subtitle", (clean_text, translated, result["language"], spk_id, False))
                     delay = max(0, time.monotonic() - segment.captured_at)
                     asr_ms = result.get('elapsed_time', 0.0) * 1000.0
                     self.emit("status", f"{'Captura detenida: procesando el búfer' if self.capture.error else 'Escuchando'} · {LANGUAGES[result['language']]} → {LANGUAGES[target_lang]} · demora: {delay:.1f} s · ASR: {asr_ms:.0f} ms · audio pendiente: {self.capture.pending_seconds:.1f} s")
         except Exception as exc:
             state = 'error'
+            logger.exception("Error en el bucle principal de traducción: %s", exc)
             self.emit("error", str(exc))
         finally:
             if self.capture:
@@ -398,15 +477,21 @@ class TranslatorApp(SettingsPanel):
             except queue.Empty:
                 break
             if kind == "subtitle":
-                original, translated, language = value
-                self.dialogue_manager.add_turn(original, translated, language)
+                if len(value) == 5:
+                    original, translated, language, spk_id, is_ov = value
+                else:
+                    original, translated, language = value[:3]
+                    spk_id, is_ov = None, False
+
+                self.dialogue_manager.add_turn(original, translated, language, speaker_id=spk_id, is_overlap=is_ov)
                 display_trans = self.dialogue_manager.get_display_translated()
                 display_orig = self.dialogue_manager.get_display_original()
                 self.original.set(f"{LANGUAGES[language]}: {display_orig}" if len(self.dialogue_manager.turns) <= 1 else display_orig)
                 self.subtitle.set(display_trans)
                 self.caption_updated = time.monotonic()
                 self.history.configure(state="normal")
-                self.history.insert("end", f"{original}\n→ {translated}\n\n")
+                spk_prefix = f"[{spk_id}] " if spk_id else ""
+                self.history.insert("end", f"{spk_prefix}{original}\n→ {spk_prefix}{translated}\n\n")
                 if int(self.history.index("end-1c").split(".")[0]) > 400:
                     self.history.delete("1.0", "100.0")
                 self.history.see("end")
@@ -471,4 +556,9 @@ class TranslatorApp(SettingsPanel):
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
     TranslatorApp(tk.Tk()).root.mainloop()

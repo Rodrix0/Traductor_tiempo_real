@@ -23,10 +23,15 @@ class HistoryStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
                     start REAL NOT NULL, end REAL NOT NULL, original TEXT NOT NULL,
-                    translated TEXT NOT NULL, language TEXT NOT NULL
+                    translated TEXT NOT NULL, language TEXT NOT NULL,
+                    speaker_id TEXT
                 );
                 CREATE INDEX IF NOT EXISTS captions_session ON captions(session_id, id);
             ''')
+            try:
+                db.execute('ALTER TABLE captions ADD COLUMN speaker_id TEXT')
+            except Exception:
+                pass
 
     @contextmanager
     def connection(self):
@@ -47,9 +52,10 @@ class HistoryStore:
         return session
 
     def add(self, session, caption):
+        speaker = getattr(caption, 'speaker_id', None)
         with self.connection() as db:
-            db.execute('INSERT INTO captions(session_id,start,end,original,translated,language) VALUES (?,?,?,?,?,?)',
-                (session, caption.start, caption.end, caption.original, caption.translated, caption.language))
+            db.execute('INSERT INTO captions(session_id,start,end,original,translated,language,speaker_id) VALUES (?,?,?,?,?,?,?)',
+                (session, caption.start, caption.end, caption.original, caption.translated, caption.language, speaker))
 
     def finish(self, session, state):
         with self.connection() as db:
@@ -67,6 +73,6 @@ class HistoryStore:
 
     def captions(self, session, limit=None):
         with self.connection() as db:
-            rows = db.execute('SELECT start,end,original,translated,language FROM captions WHERE session_id=? ORDER BY id LIMIT ?',
+            rows = db.execute('SELECT start,end,original,translated,language,speaker_id FROM captions WHERE session_id=? ORDER BY id LIMIT ?',
                 (session, limit if limit is not None else -1))
             return [Caption(**dict(row)) for row in rows]

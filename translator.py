@@ -162,8 +162,9 @@ class LocalTranslator:
 
         try:
             if self.engine == "nllb" and self.sp_nllb is not None:
-                # 1. Tokenizar para NLLB con prefijo de idioma inglés
-                tokens = self.sp_nllb.encode(text, out_type=str)
+                # Prevenir alucinaciones conversacionales en palabras sueltas ("Again." -> "- ¿Qué?")
+                clean_text = text.rstrip(".") if len(text.split()) <= 3 and not text.endswith("...") else text
+                tokens = self.sp_nllb.encode(clean_text, out_type=str)
                 source_tokens = ["eng_Latn"] + tokens + ["</s>"]
                 target_prefix = [["spa_Latn"]]
 
@@ -171,7 +172,7 @@ class LocalTranslator:
                     [source_tokens],
                     target_prefix=target_prefix,
                     max_decoding_length=150,
-                    beam_size=1,
+                    beam_size=2,
                 )
 
                 output_tokens = results[0].hypotheses[0]
@@ -188,6 +189,11 @@ class LocalTranslator:
                 )
                 output_tokens = results[0].hypotheses[0]
                 translated = self.sp_target.decode(output_tokens).strip()
+
+            # Limpiar artefactos conversacionales tipo subtítulo (- ¿Qué? - Frase)
+            translated = re.sub(r'^[-—–]\s*¿Qué\?\s*[-—–]?\s*', '', translated, flags=re.IGNORECASE).strip()
+            if not text.startswith(('-', '—', '–')) and translated.startswith(('-', '—', '–')):
+                translated = re.sub(r'^[-—–]\s*', '', translated).strip()
 
             # Aplicar glosario de términos personalizados sobre el texto final
             translated_calibrated = self.apply_glossary(translated)

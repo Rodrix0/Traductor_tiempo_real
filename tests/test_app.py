@@ -128,3 +128,110 @@ class AppTests(unittest.TestCase):
             self.app.load_sources()
         self.assertEqual(self.app.devices, [])
         self.assertIn('sin dispositivo', self.app.status.get())
+
+    def test_live_overlap_speaker_separation_path_in_app(self):
+        """
+        Verifica que ante un segmento con solapamiento, TranslatorApp.run ejecute la separación,
+        genere los Captions usando start_time/end_time sin AttributeError, y almacene ambos hablantes.
+        """
+        capture = WindowsCapture(10)
+        capture.start = lambda: setattr(capture, 'started', True)
+        capture.stop = lambda: None
+
+        sr = 16000
+        t = np.linspace(0, 1.5, int(1.5 * sr), endpoint=False, dtype=np.float32)
+        v_a = (0.5 * np.sin(2 * np.pi * 130.0 * t) + 0.25 * np.sin(2 * np.pi * 260.0 * t)).astype(np.float32)
+        v_b = (0.5 * np.sin(2 * np.pi * 240.0 * t) + 0.25 * np.sin(2 * np.pi * 480.0 * t)).astype(np.float32)
+        mixed = v_a + v_b
+
+        calls = [0]
+        def mock_transcribe(audio, **kwargs):
+            calls[0] += 1
+            txt = "We should leave right now" if calls[0] % 2 == 1 else "No wait stay here please"
+            return {'text': txt, 'language': 'en', 'elapsed_time': 0.05}
+
+        def load(model):
+            capture.enqueue(AudioSegment(mixed, 10.0, 11.5))
+            self.app.engine = SimpleNamespace(transcribe=mock_transcribe)
+
+        emitted = []
+        original_emit = self.app.emit
+        def emit(kind, value=None):
+            if kind == 'subtitle':
+                emitted.append(value)
+                if len(emitted) >= 2:
+                    self.app.stopped.set()
+            original_emit(kind, value)
+
+        from src.speakers.models import OverlapResult
+        with patch('src.audio.windows_capture.WindowsCapture', return_value=capture), \
+             patch.object(self.app, 'ensure_engine', side_effect=load), \
+             patch.object(self.app, 'emit', side_effect=emit), \
+             patch.object(self.app.translator, 'translate', side_effect=lambda text, *args: f"Trad: {text}"), \
+             patch('src.speakers.overlap_detector.OverlapDetector.detect', return_value=OverlapResult(has_overlap=True, speaker_count=2, confidence=0.9)):
+            deadline = threading.Timer(3, self.app.stopped.set)
+            deadline.start()
+            try:
+                self.app.run(False, 10, 'en', 'es', 'base')
+            finally:
+                deadline.cancel()
+
+        self.assertEqual(len(emitted), 2, "Debe emitir 2 subtítulos (uno por cada voz separada)")
+        self.assertEqual(self.app.store.search()[0]['count'], 2)
+        captions = self.app.store.captions(self.app.store.search()[0]['id'])
+        self.assertAlmostEqual(captions[0].start, 10.0, places=2)
+        self.assertAlmostEqual(captions[0].end, 11.5, places=2)
+
+    def test_live_overlap_acoustic_rejection_fallback_in_app(self):
+        """
+        Verifica el flujo real donde OverlapDetector dispara solapamiento, pero SeparationValidator
+        rechaza la separación acústica (fuga de voz dominante / duplicado) y ejecuta el fallback:
+        - Ejecuta logger.info sin NameError.
+        - Se recupera automáticamente procesando como voz individual.
+        - Emite 1 solo subtítulo y NO dispara el diálogo de error 'No se pudo continuar'.
+        """
+        capture = WindowsCapture(10)
+        capture.start = lambda: setattr(capture, 'started', True)
+        capture.stop = lambda: None
+
+        sr = 16000
+        t = np.linspace(0, 1.5, int(1.5 * sr), endpoint=False, dtype=np.float32)
+        # Una sola voz dominante
+        v_a = (0.5 * np.sin(2 * np.pi * 130.0 * t) + 0.25 * np.sin(2 * np.pi * 260.0 * t)).astype(np.float32)
+
+        def mock_transcribe(audio, **kwargs):
+            return {'text': 'I love working on myself', 'language': 'en', 'elapsed_time': 0.04}
+
+        def load(model):
+            capture.enqueue(AudioSegment(v_a, 5.0, 6.5))
+            self.app.engine = SimpleNamespace(transcribe=mock_transcribe)
+
+        emitted = []
+        errors = []
+        original_emit = self.app.emit
+        def emit(kind, value=None):
+            if kind == 'subtitle':
+                emitted.append(value)
+                self.app.stopped.set()
+            elif kind == 'error':
+                errors.append(value)
+            original_emit(kind, value)
+
+        from src.speakers.models import OverlapResult
+        with patch('src.audio.windows_capture.WindowsCapture', return_value=capture), \
+             patch.object(self.app, 'ensure_engine', side_effect=load), \
+             patch.object(self.app, 'emit', side_effect=emit), \
+             patch.object(self.app.translator, 'translate', side_effect=lambda text, *args: f"Trad: {text}"), \
+             patch('src.speakers.overlap_detector.OverlapDetector.detect', return_value=OverlapResult(has_overlap=True, speaker_count=2, confidence=0.85)):
+            deadline = threading.Timer(3, self.app.stopped.set)
+            deadline.start()
+            try:
+                self.app.run(False, 10, 'en', 'es', 'base')
+            finally:
+                deadline.cancel()
+
+        self.assertEqual(errors, [], "No debe haber ningún error emitido en el fallback")
+        self.assertEqual(len(emitted), 1, "Debe emitir exactamente 1 subtítulo tras el fallback a voz individual")
+        self.assertIn("I love working on myself", emitted[0][0])
+
+

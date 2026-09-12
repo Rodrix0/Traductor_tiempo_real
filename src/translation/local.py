@@ -53,7 +53,7 @@ class LocalTranslator:
         if source == 'en' and target == 'es' and self._marian_available():
             if self.english_spanish is None:
                 from translator import LocalTranslator as MarianTranslator
-                self.english_spanish = MarianTranslator()
+                self.english_spanish = MarianTranslator(engine="marian")
             translated = self.english_spanish.translate_en_to_es(text)
             self.context_memory.add_turn(text, translated, source, target)
             return translated
@@ -77,7 +77,7 @@ class LocalTranslator:
         if source == 'en' and self._marian_available():
             if self.english_spanish is None:
                 from translator import LocalTranslator as MarianTranslator
-                self.english_spanish = MarianTranslator()
+                self.english_spanish = MarianTranslator(engine="marian")
             if hasattr(self.english_spanish, "clean_english_source"):
                 return self.english_spanish.clean_english_source(text)
         return text
@@ -86,7 +86,7 @@ class LocalTranslator:
         if self._marian_available():
             if self.english_spanish is None:
                 from translator import LocalTranslator as MarianTranslator
-                self.english_spanish = MarianTranslator()
+                self.english_spanish = MarianTranslator(engine="marian")
             if hasattr(self.english_spanish, "get_whisper_prompt"):
                 return self.english_spanish.get_whisper_prompt()
         return None

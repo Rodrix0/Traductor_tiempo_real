@@ -32,6 +32,14 @@ class AudioSegment:
     end: float
     captured_at: float = field(default_factory=time.monotonic)
 
+    @property
+    def start_time(self) -> float:
+        return self.start
+
+    @property
+    def end_time(self) -> float:
+        return self.end
+
 
 def list_sources(include_combined: bool = True) -> Tuple[List[Tuple[int, str]], Optional[int]]:
     """
@@ -146,13 +154,19 @@ class WindowsCapture:
 
                 # Caso estándar: Dispositivo individual (Loopback o Micrófono)
                 device_info = audio.get_device_info_by_index(self.device)
+                is_loopback = bool(device_info.get("isLoopbackDevice", False))
                 rate = int(device_info["defaultSampleRate"])
                 channels = int(device_info["maxInputChannels"])
                 frames = round(rate * 0.03)
 
                 resampler = StatefulResampler(in_rate=rate, out_rate=16000, channels=channels)
 
-                silence_ms = self.silence_duration_ms or self.vad_profile.silence_duration_ms
+                # Para micrófono físico, un silencio de 450-500 ms es ideal para no acumular ruido de sala
+                if not is_loopback and self.silence_duration_ms is None and self.vad_profile == VADProfile.NATURAL:
+                    silence_ms = 450
+                else:
+                    silence_ms = self.silence_duration_ms or self.vad_profile.silence_duration_ms
+
                 vad = VoiceActivityDetector(
                     sample_rate=16000,
                     energy_threshold=self.threshold,
@@ -185,6 +199,10 @@ class WindowsCapture:
                         if len(frame_16k) == 0:
                             continue
 
+                        # Si es micrófono, remover DC offset para estabilizar el VAD y la energía
+                        if not is_loopback:
+                            frame_16k = frame_16k - np.mean(frame_16k)
+
                         elapsed_samples += len(frame_16k)
                         self.level = vad.calculate_energy(frame_16k)
 
@@ -204,6 +222,13 @@ class WindowsCapture:
                         # Procesamiento VAD integrado para cola síncrona
                         segment = vad.process_frame(frame_16k)
                         if segment is not None:
+                            # Para micrófono, normalización suave de ganancia si la señal fue muy tenue (< 0.35 pico)
+                            if not is_loopback and len(segment) > 0:
+                                peak = float(np.max(np.abs(segment)))
+                                if 0.001 < peak < 0.35:
+                                    gain = min(6.0, 0.65 / peak)
+                                    segment = np.clip(segment * gain, -1.0, 1.0).astype(np.float32)
+
                             start_s = max(0.0, (elapsed_samples - len(segment)) / 16000.0)
                             end_s = elapsed_samples / 16000.0
                             self.enqueue(AudioSegment(segment, start_s, end_s))
