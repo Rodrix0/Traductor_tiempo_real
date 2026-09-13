@@ -20,6 +20,7 @@ import numpy as np
 
 from src.audio.resampler import StatefulResampler, to_mono_16k
 from src.audio.vad import VoiceActivityDetector
+from src.audio.ring_buffer import AudioRingBuffer
 from src.pipeline.models import AudioChunk, AudioSourceMode, VADProfile
 
 logger = logging.getLogger(__name__)
@@ -101,6 +102,7 @@ class WindowsCapture:
         self.audio_queue = audio_queue
         self.vad_profile = VADProfile(vad_profile) if isinstance(vad_profile, str) else vad_profile
         self.silence_duration_ms = silence_duration_ms
+        self.ring_buffer = AudioRingBuffer(capacity_seconds=5.0, sample_rate=16000)
 
         # Cola de segmentos de voz procesados (para compatibilidad hacia atrás)
         self.segments = queue.Queue()
@@ -171,8 +173,9 @@ class WindowsCapture:
                     sample_rate=16000,
                     energy_threshold=self.threshold,
                     silence_duration_ms=silence_ms,
-                    min_speech_duration_ms=300,
+                    min_speech_duration_ms=180,
                     max_speech_duration_ms=int(self.chunk_seconds * 1000),
+                    pre_speech_padding_ms=300,
                 )
 
                 stream = audio.open(
@@ -203,6 +206,7 @@ class WindowsCapture:
                         if not is_loopback:
                             frame_16k = frame_16k - np.mean(frame_16k)
 
+                        self.ring_buffer.write(frame_16k)
                         elapsed_samples += len(frame_16k)
                         self.level = vad.calculate_energy(frame_16k)
 
@@ -291,8 +295,9 @@ class WindowsCapture:
             sample_rate=16000,
             energy_threshold=self.threshold,
             silence_duration_ms=silence_ms,
-            min_speech_duration_ms=300,
+            min_speech_duration_ms=180,
             max_speech_duration_ms=int(self.chunk_seconds * 1000),
+            pre_speech_padding_ms=300,
         )
 
         self.ready.set()
@@ -314,6 +319,7 @@ class WindowsCapture:
                 # Mezcla digital ponderada: sistema 100% + micrófono 90% (evita saturación)
                 mixed_frame = np.clip(frame_sys[:min_len] + frame_mic[:min_len] * 0.9, -1.0, 1.0).astype(np.float32)
 
+                self.ring_buffer.write(mixed_frame)
                 elapsed_samples += min_len
                 self.level = vad.calculate_energy(mixed_frame)
 

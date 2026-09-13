@@ -346,7 +346,12 @@ class TranslationWorker(threading.Thread):
                         cleaned = self.translator.clean_source(orig_text, src_lang)
 
                     try:
-                        translated = self.translator.translate(cleaned, src_lang, tgt_lang)
+                        import inspect
+                        sig = inspect.signature(self.translator.translate)
+                        if "speaker_id" in sig.parameters:
+                            translated = self.translator.translate(cleaned, src_lang, tgt_lang, speaker_id=transcript.speaker_id)
+                        else:
+                            translated = self.translator.translate(cleaned, src_lang, tgt_lang)
                     except Exception as te:
                         logger.warning("Fallo en traducción (%s -> %s): %s. Mostrando original.", src_lang, tgt_lang, te)
                         translated = orig_text
@@ -414,10 +419,14 @@ class SubtitleDispatcherWorker(threading.Thread):
                 now = time.monotonic()
                 total_latency = max(0.0, now - trans.captured_at)
 
+                from src.ui.subtitle_formatter import SubtitleFormatter
+                formatter = SubtitleFormatter(max_chars_per_line=42, max_lines=2)
+                formatted_trans = formatter.format(trans.translated_text)
+
                 sub = SubtitleItem(
                     sequence_id=trans.sequence_id,
                     original=trans.source_text,
-                    translated=trans.translated_text,
+                    translated=formatted_trans,
                     source_language=trans.source_language,
                     target_language=trans.target_language,
                     start_time=trans.start_time,

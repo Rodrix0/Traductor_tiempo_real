@@ -9,6 +9,7 @@ os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
 import time
 import logging
+import math
 import re
 from typing import Optional, Dict, Any, List
 import numpy as np
@@ -192,24 +193,58 @@ class WhisperEngine(ASREngine):
             no_repeat_ngram_size=3,  # Prohíbe repetición idéntica de 3-gramas
             compression_ratio_threshold=2.4,  # Descarta alucinaciones repetitivas
             hallucination_silence_threshold=2.0,  # Suprime alucinaciones en silencio
+            word_timestamps=True,
+            **kwargs,
         )
 
         segments_list = []
         full_text_parts: List[str] = []
+        all_words: List[Dict[str, Any]] = []
+        avg_logprobs: List[float] = []
+        no_speech_probs: List[float] = []
 
         for seg in segments_gen:
             clean_text = seg.text.strip()
             if clean_text:
                 full_text_parts.append(clean_text)
+                seg_words = []
+                if hasattr(seg, "words") and seg.words:
+                    for w in seg.words:
+                        w_info = {
+                            "word": getattr(w, "word", ""),
+                            "start": getattr(w, "start", 0.0),
+                            "end": getattr(w, "end", 0.0),
+                            "probability": getattr(w, "probability", 1.0),
+                        }
+                        seg_words.append(w_info)
+                        all_words.append(w_info)
+
+                logprob = getattr(seg, "avg_logprob", 0.0)
+                no_sp = getattr(seg, "no_speech_prob", 0.0)
+                avg_logprobs.append(logprob)
+                no_speech_probs.append(no_sp)
+
                 segments_list.append({
                     "start": seg.start,
                     "end": seg.end,
                     "text": clean_text,
+                    "avg_logprob": logprob,
+                    "no_speech_prob": no_sp,
+                    "words": seg_words,
                 })
 
         elapsed = time.perf_counter() - start_time
         full_text = " ".join(full_text_parts).strip()
         full_text = deduplicate_repetitions(full_text)
+
+        word_conf = float(np.mean([w["probability"] for w in all_words])) if all_words else 1.0
+        avg_lp = float(np.mean(avg_logprobs)) if avg_logprobs else 0.0
+        # Mapeo a confianza [0.0, 1.0]: exp(avg_lp) * word_conf
+        try:
+            exp_lp = math.exp(avg_lp) if avg_lp <= 0.0 else 1.0
+        except OverflowError:
+            exp_lp = 1.0
+        confidence = float(max(0.0, min(1.0, exp_lp * word_conf))) if avg_logprobs else 1.0
 
         return {
             "text": full_text,
@@ -217,4 +252,8 @@ class WhisperEngine(ASREngine):
             "probability": info.language_probability if info else 1.0,
             "elapsed_time": elapsed,
             "segments": segments_list,
+            "words": all_words,
+            "avg_logprob": avg_lp,
+            "no_speech_prob": float(np.mean(no_speech_probs)) if no_speech_probs else 0.0,
+            "confidence": confidence,
         }

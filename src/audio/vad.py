@@ -172,5 +172,12 @@ class VoiceActivityDetector:
         self.profile = VADProfile(profile) if isinstance(profile, str) else profile
         self.silence_duration_ms = self.profile.silence_duration_ms
 
+    def flush(self) -> Optional[np.ndarray]:
+        """Finaliza y emite cualquier segmento de voz que haya quedado abierto en el buffer."""
+        if self.is_speaking and self.current_speech_frames:
+            speech_ms = (self.speech_samples_count / self.sample_rate) * 1000.0
+            return self._finalize_speech_segment(speech_ms)
+        return None
+
     process_chunk = process_frame
 

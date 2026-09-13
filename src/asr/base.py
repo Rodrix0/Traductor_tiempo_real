@@ -5,11 +5,12 @@ Permite desacoplar el pipeline de la implementación concreta (faster-whisper, s
 """
 
 from abc import ABC, abstractmethod
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, TYPE_CHECKING
 import numpy as np
 import time
 
-from src.pipeline.models import SpeechSegment, TranscriptResult
+if TYPE_CHECKING:
+    from src.pipeline.models import SpeechSegment, TranscriptResult
 
 
 class ASREngine(ABC):
@@ -39,17 +40,19 @@ class ASREngine(ABC):
 
     def transcribe_segment(
         self,
-        segment: SpeechSegment,
+        segment: "SpeechSegment",
         language: Optional[str] = None,
         beam_size: int = 1,
         initial_prompt: Optional[str] = None,
         **kwargs
-    ) -> TranscriptResult:
+    ) -> "TranscriptResult":
         """
         Transcribe un SpeechSegment estructurado proveniente de la captura y VAD.
         Aplica protección contra Doble VAD: si el segmento ya fue delimitado por el VAD
         externo (segment.external_vad_processed == True), desactiva vad_filter en Whisper.
         """
+        from src.pipeline.models import TranscriptResult
+
         asr_start = time.monotonic()
 
         # Doble VAD protection: si segment.external_vad_processed es True, vad_filter=False

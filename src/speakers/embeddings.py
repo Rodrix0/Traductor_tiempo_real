@@ -99,22 +99,28 @@ class SpectralEmbeddingProvider(SpeakerEmbeddingProvider):
         mel_spec = np.dot(self._mel_basis, power_spec[:self.n_fft // 2 + 1, :])
         log_mel = np.log1p(mel_spec)
 
-        # Estadísticas temporales: media y desviación estándar por banda Mel (48 x 2 = 96)
-        mel_mean = np.mean(log_mel, axis=1)
-        mel_std = np.std(log_mel, axis=1)
+        # Usar DCT ortogonal para extraer coeficientes MFCC 1 a 24 (timbre vocal decorrelacionado)
+        from scipy import fftpack
+        mfccs = fftpack.dct(log_mel, type=2, axis=0, norm='ortho')[1:25]
+        mfcc_mean = np.mean(mfccs, axis=1)
+        mfcc_std = np.std(mfccs, axis=1)
 
-        # Estadísticas adicionales: centroide espectral y pendiente (tilt)
+        # Estadísticas adicionales: centroide espectral escalado
         freqs = np.linspace(0, self.sample_rate / 2, self.n_fft // 2 + 1)
         spectral_centroid = np.sum(freqs[:, None] * power_spec, axis=0) / (np.sum(power_spec, axis=0) + 1e-7)
         c_mean = float(np.mean(spectral_centroid)) / (self.sample_rate / 2)
         c_std = float(np.std(spectral_centroid)) / (self.sample_rate / 2)
 
-        # Vector de características compuesto
+        # Medias Mel con sustracción de media (cepstral mean normalization)
+        mel_mean = np.mean(log_mel, axis=1)
+        mel_mean_centered = mel_mean - np.mean(mel_mean)
+
+        # Vector de características compuesto (64-D exactas)
         raw_feat = np.concatenate([
-            mel_mean[:28],              # 28 bandas medias/bajas (formantes clave)
-            mel_std[:24],               # 24 varianzas de banda
-            [c_mean, c_std],            # 2 de centroide
-            mel_mean[28:38],            # 10 bandas altas
+            mfcc_mean,                      # 24 medias MFCC (formantes vocales)
+            mfcc_std,                       # 24 varianzas MFCC (dinámica espectral)
+            [c_mean * 0.1, c_std * 0.1],    # 2 de centroide balanceado
+            mel_mean_centered[:14],         # 14 bandas Mel centradas
         ]).astype(np.float32)
 
         # Asegurar longitud exacta de 64 dimensiones

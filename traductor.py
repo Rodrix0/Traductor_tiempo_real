@@ -365,15 +365,57 @@ class TranslatorApp(SettingsPanel):
             from src.separation.validator import SeparationValidator
             from src.speakers.tracker import SpeakerTracker
             from src.speakers.duplicate_resolver import DuplicateTranscriptResolver
+            from src.pipeline.segment_reassembler import SegmentReassembler
+            from src.asr.retry_engine import ContextAwareSTTRetry
+            from src.asr.anomaly_detector import STTAnomalyDetector
+            from src.translation.context_manager import ConversationContextManager
+            from src.translation.context_aware_translator import ContextAwareTranslator
+            from src.ui.subtitle_formatter import SubtitleFormatter
+            from src.utils.debug_logger import SubtitleDebugLogger
+            from src.diagnostics.real_audio_logger import default_real_audio_logger
 
             overlap_detector = OverlapDetector(sample_rate=16000)
             separator_manager = SpeechSeparatorManager(mode=sep_mode, sample_rate=16000)
             separation_validator = SeparationValidator(sample_rate=16000)
             speaker_tracker = SpeakerTracker(sample_rate=16000)
             duplicate_resolver = DuplicateTranscriptResolver()
+            segment_assembler = SegmentReassembler(debounce_seconds=0.35, max_pause_seconds=1.2)
+            stt_retry_engine = ContextAwareSTTRetry(
+                asr_engine=self.engine,
+                ring_buffer=getattr(self.capture, "ring_buffer", None),
+                anomaly_detector=STTAnomalyDetector(),
+            )
+            context_mgr = ConversationContextManager()
+            context_translator = ContextAwareTranslator(
+                glossary=translator.glossary if hasattr(translator, "glossary") else None,
+                context_manager=context_mgr,
+            )
+            subtitle_formatter = SubtitleFormatter(max_chars_per_line=42, max_lines=2)
+            debug_logger = SubtitleDebugLogger(enabled=True)
+
             while not self.stopped.is_set():
                 if self.capture.error and self.capture.segments.empty():
                     raise self.capture.error
+
+                # Emitir segmentos pendientes por debounce de tiempo en el ensamblador
+                for t_seg in segment_assembler.check_timeouts():
+                    t0_tr = time.monotonic()
+                    trans = context_translator.translate(t_seg.text, source_lang or 'en', target_lang, speaker_id=t_seg.speaker_id)
+                    tr_lat = (time.monotonic() - t0_tr) * 1000.0
+                    formatted_trans = subtitle_formatter.format(trans)
+                    if not self.stopped.is_set():
+                        self.store.add(session, Caption(t_seg.start_time, t_seg.end_time, t_seg.text, trans, source_lang or 'en', speaker_id=t_seg.speaker_id))
+                        self.emit("subtitle", (t_seg.text, formatted_trans, source_lang or 'en', t_seg.speaker_id, False))
+                        debug_logger.log_event(
+                            raw_stt=t_seg.raw_fragments[0] if t_seg.raw_fragments else t_seg.text,
+                            merged_stt=t_seg.text,
+                            context_segments=context_mgr.get_speaker_context(t_seg.speaker_id),
+                            translation=trans,
+                            speaker_id=t_seg.speaker_id,
+                            stt_confidence=t_seg.confidence,
+                            translation_latency_ms=tr_lat,
+                        )
+
                 try:
                     segment = self.capture.segments.get(timeout=0.1)
                 except queue.Empty:
@@ -398,11 +440,33 @@ class TranslatorApp(SettingsPanel):
                                 assignments = speaker_tracker.assign_sources(sources)
                                 raw_transcripts = []
                                 for src, assign in zip(sources, assignments):
+                                    sep_seg_id = default_real_audio_logger.get_next_segment_id() if default_real_audio_logger.enabled else None
+                                    if sep_seg_id:
+                                        default_real_audio_logger.save_exact_audio(src.audio, sample_rate=16000, segment_id=sep_seg_id)
                                     res = self.engine.transcribe(src.audio, language=source_lang, initial_prompt=prompt, vad_filter=False)
                                     if not res["text"] or self.stopped.is_set():
                                         continue
                                     if res["language"] not in LANGUAGES:
                                         continue
+                                    if sep_seg_id and default_real_audio_logger.enabled:
+                                        default_real_audio_logger.save_metadata(
+                                            segment_id=sep_seg_id,
+                                            audio=src.audio,
+                                            sample_rate=16000,
+                                            capture_start=src.start_time,
+                                            capture_end=src.end_time,
+                                            vad_start=src.start_time,
+                                            vad_end=src.end_time,
+                                            speaker_id=assign.speaker_id,
+                                            raw_stt=res.get("text", ""),
+                                            retry_stt="",
+                                            reassembled_stt=res.get("text", ""),
+                                            final_stt=res.get("text", ""),
+                                            avg_logprob=res.get("avg_logprob", 0.0),
+                                            no_speech_probability=res.get("no_speech_prob", 0.0),
+                                            stt_confidence=res.get("confidence", 0.9),
+                                            words=res.get("words", []),
+                                        )
                                     raw_transcripts.append({
                                         "src": src,
                                         "assign": assign,
@@ -419,11 +483,22 @@ class TranslatorApp(SettingsPanel):
                                 if resolved:
                                     is_multi = len(resolved) > 1
                                     for item in resolved:
-                                        clean = translator.clean_source(item["text"], item["language"]) if hasattr(translator, "clean_source") else item["text"]
-                                        trans = translator.translate(clean, item["language"], target_lang)
+                                        t0_trans = time.monotonic()
+                                        trans = context_translator.translate(item["text"], item["language"], target_lang, speaker_id=item["speaker_id"])
+                                        trans_lat_ms = (time.monotonic() - t0_trans) * 1000.0
+                                        formatted_trans = subtitle_formatter.format(trans)
                                         if not self.stopped.is_set():
-                                            self.store.add(session, Caption(item["start_time"], item["end_time"], clean, trans, item["language"], speaker_id=item["speaker_id"]))
-                                            self.emit("subtitle", (clean, trans, item["language"], item["speaker_id"], is_multi))
+                                            self.store.add(session, Caption(item["start_time"], item["end_time"], item["text"], trans, item["language"], speaker_id=item["speaker_id"]))
+                                            self.emit("subtitle", (item["text"], formatted_trans, item["language"], item["speaker_id"], is_multi))
+                                            debug_logger.log_event(
+                                                raw_stt=item["text"],
+                                                merged_stt=item["text"],
+                                                context_segments=context_mgr.get_speaker_context(item["speaker_id"]),
+                                                translation=trans,
+                                                speaker_id=item["speaker_id"],
+                                                stt_confidence=item.get("confidence", 0.9),
+                                                translation_latency_ms=trans_lat_ms,
+                                            )
                                     continue
                             else:
                                 # Fallback acústico: el validador determinó que ambas salidas son la misma voz
@@ -433,20 +508,115 @@ class TranslatorApp(SettingsPanel):
 
                 # Flujo normal para una sola persona hablando
                 spk_id = speaker_tracker.register_solo_speech(segment.audio, duration=segment.end - segment.start)
+
+                # Diagnóstico acústico y volcado físico de audio real
+                seg_id = default_real_audio_logger.get_next_segment_id() if default_real_audio_logger.enabled else None
+                if seg_id:
+                    default_real_audio_logger.save_exact_audio(segment.audio, sample_rate=16000, segment_id=seg_id)
+
                 result = self.engine.transcribe(segment.audio, language=source_lang, initial_prompt=prompt, vad_filter=False)
+                result = stt_retry_engine.maybe_retry(
+                    audio=segment.audio,
+                    stt_result=result,
+                    context_prompt=prompt,
+                    language=source_lang,
+                )
                 if not result["text"] or self.stopped.is_set():
+                    if seg_id and default_real_audio_logger.enabled:
+                        default_real_audio_logger.save_metadata(
+                            segment_id=seg_id,
+                            audio=segment.audio,
+                            sample_rate=16000,
+                            capture_start=segment.start,
+                            capture_end=segment.end,
+                            vad_start=segment.start,
+                            vad_end=segment.end,
+                            speaker_id=spk_id,
+                            raw_stt=result.get("raw_whisper_text", result.get("text", "")),
+                            retry_stt=result.get("retry_whisper_text", ""),
+                            reassembled_stt="",
+                            final_stt="",
+                            avg_logprob=result.get("avg_logprob", 0.0),
+                            no_speech_probability=result.get("no_speech_prob", 0.0),
+                            stt_confidence=result.get("confidence", 0.0),
+                            retry_used=result.get("retry_used", False),
+                            retry_reason=result.get("why_retry_triggered", "none"),
+                            words=result.get("words", []),
+                            loss_class="STT_MISSING" if not result["text"] else "NONE",
+                        )
                     continue
                 if result["language"] not in LANGUAGES:
                     self.emit("status", "Se detectó otro idioma. Elegí español, inglés o portugués como origen.")
                     continue
-                clean_text = translator.clean_source(result["text"], result["language"]) if hasattr(translator, "clean_source") else result["text"]
-                translated = translator.translate(clean_text, result["language"], target_lang)
+
+                raw_text = result["text"].strip()
+                # Ensamblado semántico de oraciones completas
+                assembled = segment_assembler.add_segment(
+                    text=raw_text,
+                    speaker_id=spk_id,
+                    start_time=segment.start,
+                    end_time=segment.end,
+                    confidence=result.get("confidence", 0.95),
+                )
+                if seg_id and default_real_audio_logger.enabled:
+                    default_real_audio_logger.save_metadata(
+                        segment_id=seg_id,
+                        audio=segment.audio,
+                        sample_rate=16000,
+                        capture_start=segment.start,
+                        capture_end=segment.end,
+                        vad_start=segment.start,
+                        vad_end=segment.end,
+                        speaker_id=spk_id,
+                        raw_stt=result.get("raw_whisper_text", raw_text),
+                        retry_stt=result.get("retry_whisper_text", ""),
+                        reassembled_stt=assembled.text if assembled else "",
+                        final_stt=assembled.text if assembled else "",
+                        avg_logprob=result.get("avg_logprob", 0.0),
+                        no_speech_probability=result.get("no_speech_prob", 0.0),
+                        stt_confidence=assembled.confidence if assembled else result.get("confidence", 0.95),
+                        retry_used=result.get("retry_used", False),
+                        retry_reason=result.get("why_retry_triggered", "none"),
+                        words=result.get("words", []),
+                        loss_class="PIPELINE_MISSING" if assembled is None else "NONE",
+                    )
+                if assembled is None:
+                    continue
+
+                t0_trans = time.monotonic()
+                translated = context_translator.translate(
+                    assembled.text,
+                    result["language"],
+                    target_lang,
+                    speaker_id=spk_id,
+                )
+                trans_lat_ms = (time.monotonic() - t0_trans) * 1000.0
+                formatted_trans = subtitle_formatter.format(translated)
+
                 if not self.stopped.is_set():
-                    self.store.add(session, Caption(segment.start, segment.end, clean_text, translated, result['language'], speaker_id=spk_id))
-                    self.emit("subtitle", (clean_text, translated, result["language"], spk_id, False))
+                    self.store.add(session, Caption(assembled.start_time, assembled.end_time, assembled.text, translated, result['language'], speaker_id=spk_id))
+                    self.emit("subtitle", (assembled.text, formatted_trans, result["language"], spk_id, False))
                     delay = max(0, time.monotonic() - segment.captured_at)
                     asr_ms = result.get('elapsed_time', 0.0) * 1000.0
-                    self.emit("status", f"{'Captura detenida: procesando el búfer' if self.capture.error else 'Escuchando'} · {LANGUAGES[result['language']]} → {LANGUAGES[target_lang]} · demora: {delay:.1f} s · ASR: {asr_ms:.0f} ms · audio pendiente: {self.capture.pending_seconds:.1f} s")
+                    tot_lat_ms = asr_ms + trans_lat_ms
+                    self.emit("status", f"{'Captura detenida: procesando el búfer' if self.capture.error else 'Escuchando'} · {LANGUAGES[result['language']]} → {LANGUAGES[target_lang]} · demora: {delay:.1f} s · ASR: {asr_ms:.0f} ms · Trans: {trans_lat_ms:.0f} ms · audio pendiente: {self.capture.pending_seconds:.1f} s")
+                    debug_logger.log_event(
+                        raw_stt=raw_text,
+                        merged_stt=assembled.text,
+                        context_segments=context_mgr.get_speaker_context(spk_id),
+                        translation=translated,
+                        speaker_id=spk_id,
+                        stt_confidence=assembled.confidence,
+                        asr_latency_ms=asr_ms,
+                        translation_latency_ms=trans_lat_ms,
+                        total_latency_ms=tot_lat_ms,
+                    )
+
+            # Vaciar fragmentos acumulados al detener la sesión
+            for r_seg in segment_assembler.flush_all():
+                r_trans = context_translator.translate(r_seg.text, source_lang or 'en', target_lang, speaker_id=r_seg.speaker_id)
+                self.store.add(session, Caption(r_seg.start_time, r_seg.end_time, r_seg.text, r_trans, source_lang or 'en', speaker_id=r_seg.speaker_id))
+                self.emit("subtitle", (r_seg.text, subtitle_formatter.format(r_trans), source_lang or 'en', r_seg.speaker_id, False))
         except Exception as exc:
             state = 'error'
             logger.exception("Error en el bucle principal de traducción: %s", exc)
