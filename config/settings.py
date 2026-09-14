@@ -52,6 +52,16 @@ MAX_SPEECH_DURATION_MS: int = 12000
 # Milisegundos de audio previo (pre-roll buffer) para no cortar la primera sílaba ("I've done", "Well")
 PRE_SPEECH_PADDING_MS: int = 300
 
+# SentenceTurnAssembler: VAD reports speech/no-speech; these thresholds decide
+# when a speaker-isolated sentence has enough evidence to be confirmed.
+MIN_CONTINUATION_PAUSE_MS: int = 250
+SENTENCE_END_PAUSE_MS: int = 650
+TURN_END_PAUSE_MS: int = 900
+SENTENCE_COMPLETION_THRESHOLD: float = 0.58
+MAX_SENTENCE_DURATION_SECONDS: float = 18.0
+FINAL_ASR_PRE_ROLL_MS: int = 280
+FINAL_ASR_POST_ROLL_MS: int = 300
+
 # -------------------------------------------------------------
 # Configuración de Reconocimiento de Voz (faster-whisper)
 # -------------------------------------------------------------
@@ -77,4 +87,3 @@ BEAM_SIZE: int = 1
 REAL_AUDIO_DEBUG: bool = os.environ.get("REAL_AUDIO_DEBUG", "1").lower() in ("1", "true", "yes")
 DEBUG_AUDIO_DIR: Path = APP_DIR / "debug_audio"
 DEBUG_AUDIO_DIR.mkdir(exist_ok=True)
-

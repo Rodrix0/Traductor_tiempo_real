@@ -19,8 +19,13 @@ class AppTests(unittest.TestCase):
         def load(model):
             self.assertTrue(capture.started, 'La captura debe abrirse antes de cargar modelos')
             for i in range(5):
-                capture.enqueue(AudioSegment(np.full(64000,i,dtype=np.float32),i*4,(i+1)*4))
-            self.app.engine = SimpleNamespace(transcribe=lambda audio, **kwargs: {'text':str(int(audio[0])), 'language':'en'})
+                capture.enqueue(AudioSegment(
+                    np.full(64000, i, dtype=np.float32), i * 4, (i + 1) * 4,
+                    trailing_silence_ms=800,
+                ))
+            self.app.engine = SimpleNamespace(transcribe=lambda audio, **kwargs: {
+                'text': f"{int(np.max(audio))}.", 'language': 'en'
+            })
         emitted = []
         original_emit = self.app.emit
         def emit(kind, value=None):
@@ -29,14 +34,14 @@ class AppTests(unittest.TestCase):
                 if len(emitted) == 5:
                     self.app.stopped.set()
             original_emit(kind,value)
-        with patch('src.audio.windows_capture.WindowsCapture',return_value=capture), patch.object(self.app,'ensure_engine',side_effect=load), patch.object(self.app,'emit',side_effect=emit), patch.object(self.app.translator,'translate',side_effect=lambda text,*args:text):
+        with patch('src.audio.windows_capture.WindowsCapture',return_value=capture), patch.object(self.app,'ensure_engine',side_effect=load), patch.object(self.app,'emit',side_effect=emit), patch.object(self.app.translator,'translate',side_effect=lambda text,*args:text), patch('src.speakers.tracker.SpeakerTracker.register_solo_speech', return_value='SPEAKER_01'):
             deadline = threading.Timer(2,self.app.stopped.set)
             deadline.start()
             try:
                 self.app.run(False,10,'en','es','base')
             finally:
                 deadline.cancel()
-        self.assertEqual(emitted,['0','1','2','3','4'])
+        self.assertEqual(emitted,['0.','1.','2.','3.','4.'])
         self.assertEqual(self.app.store.search()[0]['count'],5)
     def setUp(self):
         self.root = tk.Tk()
@@ -222,6 +227,7 @@ class AppTests(unittest.TestCase):
              patch.object(self.app, 'ensure_engine', side_effect=load), \
              patch.object(self.app, 'emit', side_effect=emit), \
              patch.object(self.app.translator, 'translate', side_effect=lambda text, *args: f"Trad: {text}"), \
+             patch('src.separation.validator.SeparationValidator.validate', return_value=SimpleNamespace(is_valid_two_speakers=False, reason='SAME_SPEAKER')), \
              patch('src.speakers.overlap_detector.OverlapDetector.detect', return_value=OverlapResult(has_overlap=True, speaker_count=2, confidence=0.85)):
             deadline = threading.Timer(3, self.app.stopped.set)
             deadline.start()
@@ -233,5 +239,4 @@ class AppTests(unittest.TestCase):
         self.assertEqual(errors, [], "No debe haber ningún error emitido en el fallback")
         self.assertEqual(len(emitted), 1, "Debe emitir exactamente 1 subtítulo tras el fallback a voz individual")
         self.assertIn("I love working on myself", emitted[0][0])
-
 

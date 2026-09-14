@@ -32,6 +32,8 @@ class AudioSegment:
     start: float
     end: float
     captured_at: float = field(default_factory=time.monotonic)
+    end_reason: str = "silence"
+    trailing_silence_ms: int = 0
 
     @property
     def start_time(self) -> float:
@@ -112,6 +114,11 @@ class WindowsCapture:
         self.dropped: int = 0
         self.thread: Optional[threading.Thread] = None
         self.ready = threading.Event()
+        self._vad = None
+
+    @property
+    def acoustic_progress(self):
+        return self._vad.acoustic_progress if self._vad is not None else None
 
     def start(self):
         if self.thread and self.thread.is_alive():
@@ -126,6 +133,11 @@ class WindowsCapture:
             raise RuntimeError("El dispositivo de audio no respondió. Actualizá la lista y volvé a intentar.")
         if self.error:
             raise RuntimeError(f"No se pudo abrir el dispositivo: {self.error}") from self.error
+
+    def stream_to_queue(self, target_queue: queue.Queue, stop_event: Optional[threading.Event] = None):
+        """Run capture as a raw continuous source for PipelineController."""
+        self.audio_queue = target_queue
+        self.start()
 
     def enqueue(self, segment: AudioSegment):
         """Encola un segmento de audio asegurando control de desbordamiento de memoria."""
@@ -178,6 +190,7 @@ class WindowsCapture:
                     pre_speech_padding_ms=300,
                 )
 
+                self._vad = vad
                 stream = audio.open(
                     format=pa.paFloat32,
                     channels=channels,
@@ -222,6 +235,7 @@ class WindowsCapture:
                                 self.audio_queue.put_nowait(chunk)
                             except queue.Full:
                                 self.dropped += 1
+                            continue
 
                         # Procesamiento VAD integrado para cola síncrona
                         segment = vad.process_frame(frame_16k)
@@ -233,9 +247,9 @@ class WindowsCapture:
                                     gain = min(6.0, 0.65 / peak)
                                     segment = np.clip(segment * gain, -1.0, 1.0).astype(np.float32)
 
-                            start_s = max(0.0, (elapsed_samples - len(segment)) / 16000.0)
-                            end_s = elapsed_samples / 16000.0
-                            self.enqueue(AudioSegment(segment, start_s, end_s))
+                            end_s = (elapsed_samples - vad.speech_samples_count) / 16000.0
+                            start_s = max(0.0, end_s - len(segment) / 16000.0)
+                            self.enqueue(AudioSegment(segment, start_s, end_s, end_reason=vad.last_finalize_reason or "silence", trailing_silence_ms=vad.last_trailing_silence_ms))
 
                 finally:
                     stream.stop_stream()
@@ -300,6 +314,7 @@ class WindowsCapture:
             pre_speech_padding_ms=300,
         )
 
+        self._vad = vad
         self.ready.set()
         elapsed_samples = 0
 
@@ -334,12 +349,13 @@ class WindowsCapture:
                         self.audio_queue.put_nowait(chunk)
                     except queue.Full:
                         self.dropped += 1
+                    continue
 
                 segment = vad.process_frame(mixed_frame)
                 if segment is not None:
-                    start_s = max(0.0, (elapsed_samples - len(segment)) / 16000.0)
-                    end_s = elapsed_samples / 16000.0
-                    self.enqueue(AudioSegment(segment, start_s, end_s))
+                    end_s = (elapsed_samples - vad.speech_samples_count) / 16000.0
+                    start_s = max(0.0, end_s - len(segment) / 16000.0)
+                    self.enqueue(AudioSegment(segment, start_s, end_s, end_reason=vad.last_finalize_reason or "silence", trailing_silence_ms=vad.last_trailing_silence_ms))
 
         finally:
             sys_stream.stop_stream()
@@ -354,4 +370,3 @@ class WindowsCapture:
 
 
 WASAPICapture = WindowsCapture
-

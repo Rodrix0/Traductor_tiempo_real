@@ -74,13 +74,20 @@ class ASREngine(ABC):
             session_id=segment.session_id,
             text=result_dict.get("text", "").strip(),
             language=result_dict.get("language", language or "en"),
-            confidence=float(result_dict.get("probability", 1.0)),
+            confidence=float(result_dict.get("confidence", result_dict.get("probability", 1.0))),
             start_time=segment.start_time,
             end_time=segment.end_time,
             captured_at=segment.captured_at,
             asr_start_time=asr_start,
             asr_duration=asr_duration,
             engine_name=getattr(self, "model_size", "faster-whisper"),
+            is_partial=segment.end_reason == "max_duration",
+            audio=segment.audio,
+            word_timestamps=list(result_dict.get("words", [])),
+            avg_logprob=float(result_dict.get("avg_logprob", 0.0)),
+            no_speech_probability=float(result_dict.get("no_speech_prob", 0.0)),
+            end_reason=segment.end_reason,
+            trailing_silence_ms=segment.trailing_silence_ms,
         )
 
     @property

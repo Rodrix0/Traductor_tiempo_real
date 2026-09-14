@@ -133,45 +133,47 @@ class IntraSegmentDiarizer:
 
                 if is_different_speaker:
                     import time
-                    spk1 = self.speaker_tracker.register_solo_speech(part1_audio, duration=split_time)
-                    spk2 = self.speaker_tracker.register_solo_speech(part2_audio, duration=dur - split_time)
-                    if spk2 == spk1:
-                        other_profiles = [p for p in self.speaker_tracker.profiles.keys() if p != spk1]
-                        if other_profiles:
-                            spk2 = other_profiles[0]
-                        else:
-                            spk2 = self.speaker_tracker._next_speaker_id()
-                            self.speaker_tracker._create_profile(spk2, emb2, dur - split_time, time.monotonic(), pitch=pitch2)
-                            self.speaker_tracker.last_active_speaker = spk2
-
                     words1 = words[: split_idx + 1]
-                    words2 = words[split_idx + 1 :]
-
-                    text1 = " ".join(w.get("word", "").strip() for w in words1).strip()
-                    text2 = " ".join(w.get("word", "").strip() for w in words2).strip()
-
-                    return [
-                        AttributedSubsegment(
-                            text=text1,
-                            speaker_id=spk1,
-                            start_time=base_start_time,
-                            end_time=base_start_time + split_time,
-                            audio=part1_audio,
-                            confidence=0.90,
-                            is_intra_split=True,
-                            words=words1,
-                        ),
-                        AttributedSubsegment(
-                            text=text2,
-                            speaker_id=spk2,
-                            start_time=base_start_time + split_time,
-                            end_time=base_end_time,
-                            audio=part2_audio,
-                            confidence=0.90,
-                            is_intra_split=True,
-                            words=words2,
-                        ),
+                    words2 = [
+                        {
+                            **word,
+                            "start": max(0.0, float(word.get("start", split_time)) - split_time),
+                            "end": max(0.0, float(word.get("end", split_time)) - split_time),
+                        }
+                        for word in words[split_idx + 1 :]
                     ]
+
+                    # Recurse on both sides so one long VAD block can contain A -> B -> A
+                    # (or more turns), rather than stopping after the first detected change.
+                    left = self.diarize_segment(
+                        part1_audio,
+                        base_start_time,
+                        base_start_time + split_time,
+                        words1,
+                        " ".join(w.get("word", "").strip() for w in words1).strip(),
+                    )
+                    right = self.diarize_segment(
+                        part2_audio,
+                        base_start_time + split_time,
+                        base_end_time,
+                        words2,
+                        " ".join(w.get("word", "").strip() for w in words2).strip(),
+                    )
+                    if left and right and left[-1].speaker_id == right[0].speaker_id:
+                        other_profiles = [p for p in self.speaker_tracker.profiles if p != left[-1].speaker_id]
+                        if other_profiles:
+                            right[0].speaker_id = other_profiles[0]
+                        else:
+                            new_id = self.speaker_tracker._next_speaker_id()
+                            self.speaker_tracker._create_profile(
+                                new_id, emb2, dur - split_time, time.monotonic(), pitch=pitch2
+                            )
+                            right[0].speaker_id = new_id
+                            self.speaker_tracker.last_active_speaker = new_id
+                    for item in left + right:
+                        item.is_intra_split = True
+                        item.confidence = min(item.confidence, 0.90)
+                    return left + right
 
         # 3. Si no hubo división válida, asignar como un solo hablante
         spk_id = self.speaker_tracker.register_solo_speech(audio, duration=dur)

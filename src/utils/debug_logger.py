@@ -65,3 +65,12 @@ class SubtitleDebugLogger:
         # Emitir vía logger y print para visibilidad en consola debug
         logger.info(formatted)
         print(formatted)
+
+    def log_stage(self, stage: str, speaker_id: str, text: str, **details) -> None:
+        """Log streaming state without presenting partial text as a translation."""
+        if not self.enabled:
+            return
+        suffix = ""
+        if details:
+            suffix = " | " + " | ".join(f"{key}={value}" for key, value in details.items())
+        logger.info("[%s]\n%s:\n\"%s\"%s", stage, speaker_id, text, suffix)

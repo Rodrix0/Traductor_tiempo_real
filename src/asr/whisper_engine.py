@@ -11,6 +11,7 @@ import time
 import logging
 import math
 import re
+from pathlib import Path
 from typing import Optional, Dict, Any, List
 import numpy as np
 
@@ -24,6 +25,35 @@ from config.settings import (
 from src.asr.base import ASREngine
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_local_model(model_size: str, download_root: str) -> str:
+    """Resolve an installed Hugging Face snapshot without making a hub request."""
+    root = Path(download_root)
+    direct = Path(model_size)
+    if direct.is_dir() and (direct / "model.bin").exists():
+        return str(direct)
+    aliases = {
+        "distil-small.en": "models--Systran--faster-distil-whisper-small.en",
+        "distil-medium.en": "models--Systran--faster-distil-whisper-medium.en",
+    }
+    cache_name = aliases.get(model_size, f"models--Systran--faster-whisper-{model_size}")
+    repository = root / cache_name
+    ref = repository / "refs" / "main"
+    revisions = []
+    if ref.exists():
+        revisions.append(ref.read_text(encoding="utf-8").strip())
+    snapshots = repository / "snapshots"
+    if snapshots.exists():
+        revisions.extend(path.name for path in snapshots.iterdir() if path.is_dir())
+    for revision in dict.fromkeys(revisions):
+        candidate = snapshots / revision
+        if (candidate / "model.bin").exists() and (candidate / "config.json").exists():
+            return str(candidate)
+    raise FileNotFoundError(
+        f"El modelo Whisper '{model_size}' no está instalado localmente en {root}. "
+        "El traductor no intentará descargarlo porque funciona en modo offline."
+    )
 
 
 def deduplicate_repetitions(text: str) -> str:
@@ -60,6 +90,7 @@ class WhisperEngine(ASREngine):
     def _load_model(self, requested_device: str, requested_compute_type: str) -> None:
         """Carga el modelo faster-whisper con soporte de fallback automático a CPU."""
         from faster_whisper import WhisperModel
+        local_model_path = _resolve_local_model(self.model_size, self.download_root)
 
         target_device = requested_device
         target_compute = requested_compute_type
@@ -91,7 +122,7 @@ class WhisperEngine(ASREngine):
 
         try:
             self.model = WhisperModel(
-                self.model_size,
+                local_model_path,
                 device=target_device,
                 compute_type=target_compute,
                 download_root=self.download_root,
@@ -111,7 +142,7 @@ class WhisperEngine(ASREngine):
                     str(e),
                 )
                 self.model = WhisperModel(
-                    self.model_size,
+                    local_model_path,
                     device="cpu",
                     compute_type="int8",
                     download_root=self.download_root,

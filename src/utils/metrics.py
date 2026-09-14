@@ -29,8 +29,9 @@ def compute_wer(reference: str, hypothesis: str) -> float:
     """
     Calcula el Word Error Rate (WER) estándar mediante distancia de Levenshtein a nivel de palabras.
     """
-    ref_words = reference.strip().split()
-    hyp_words = hypothesis.strip().split()
+    import re
+    ref_words = re.findall(r"\b\w+(?:'\w+)?\b", reference.casefold())
+    hyp_words = re.findall(r"\b\w+(?:'\w+)?\b", hypothesis.casefold())
 
     if not ref_words:
         return 0.0 if not hyp_words else 1.0

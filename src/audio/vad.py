@@ -56,6 +56,12 @@ class VoiceActivityDetector:
         self.is_speaking = False
         self.silence_samples_count = 0
         self.speech_samples_count = 0
+        self.last_finalize_reason: Optional[str] = None
+        self.last_trailing_silence_ms: int = 0
+        # Atomic snapshot in audio time, independent of ASR/queue latency.
+        self.acoustic_progress = (0.0, 0.0)
+        self._processed_samples = 0
+        self._last_voice_sample = 0
 
     @staticmethod
     def calculate_energy(frame: np.ndarray) -> float:
@@ -76,6 +82,13 @@ class VoiceActivityDetector:
 
         energy = self.calculate_energy(frame)
         frame_is_speech = energy >= self.energy_threshold
+        self._processed_samples += frame_len
+        if frame_is_speech:
+            self._last_voice_sample = self._processed_samples
+        self.acoustic_progress = (
+            self._processed_samples / self.sample_rate,
+            self._last_voice_sample / self.sample_rate,
+        )
 
         # Estado 1: Actualmente en silencio (esperando que alguien comience a hablar)
         if not self.is_speaking:
@@ -106,7 +119,7 @@ class VoiceActivityDetector:
 
         # Caso A: El silencio posterior superó el umbral configurado (ej. 700ms)
         if silence_ms >= self.silence_duration_ms:
-            return self._finalize_speech_segment(speech_ms)
+            return self._finalize_speech_segment(speech_ms, reason="silence", trailing_silence_ms=int(silence_ms))
 
         # Caso B: El usuario habló continuamente durante mucho tiempo
         # Cortar de forma inteligente en el valle de menor energía para no cortar palabras
@@ -125,7 +138,7 @@ class VoiceActivityDetector:
         search_window = min(int((1.5 * self.sample_rate) / frame_len), max(2, total_frames // 2))
 
         if total_frames < 4 or search_window < 2:
-            return self._finalize_speech_segment((self.speech_samples_count / self.sample_rate) * 1000.0)
+            return self._finalize_speech_segment((self.speech_samples_count / self.sample_rate) * 1000.0, reason="max_duration")
 
         start_idx = total_frames - search_window
         energies = [self.calculate_energy(f) for f in self.current_speech_frames[start_idx:]]
@@ -141,10 +154,12 @@ class VoiceActivityDetector:
         self.current_speech_frames = remaining_frames
         self.speech_samples_count = sum(len(f) for f in remaining_frames)
         self.silence_samples_count = 0
+        self.last_finalize_reason = "max_duration"
+        self.last_trailing_silence_ms = 0
 
         return audio_segment
 
-    def _finalize_speech_segment(self, speech_ms: float) -> Optional[np.ndarray]:
+    def _finalize_speech_segment(self, speech_ms: float, reason: str = "silence", trailing_silence_ms: int = 0) -> Optional[np.ndarray]:
         """Finaliza y resetea el segmento actual de voz."""
         audio_segment = None
         if speech_ms >= self.min_speech_duration_ms and self.current_speech_frames:
@@ -156,6 +171,8 @@ class VoiceActivityDetector:
         self.speech_samples_count = 0
         self.silence_samples_count = 0
         self.pre_speech_buffer.clear()
+        self.last_finalize_reason = reason
+        self.last_trailing_silence_ms = max(0, int(trailing_silence_ms))
 
         return audio_segment
 
@@ -166,6 +183,11 @@ class VoiceActivityDetector:
         self.pre_speech_buffer.clear()
         self.speech_samples_count = 0
         self.silence_samples_count = 0
+        self.last_finalize_reason = None
+        self.last_trailing_silence_ms = 0
+        self._processed_samples = 0
+        self._last_voice_sample = 0
+        self.acoustic_progress = (0.0, 0.0)
 
     def set_profile(self, profile: Union[VADProfile, str]) -> None:
         """Cambia dinámicamente el perfil VAD y actualiza la ventana de silencio."""
@@ -176,8 +198,7 @@ class VoiceActivityDetector:
         """Finaliza y emite cualquier segmento de voz que haya quedado abierto en el buffer."""
         if self.is_speaking and self.current_speech_frames:
             speech_ms = (self.speech_samples_count / self.sample_rate) * 1000.0
-            return self._finalize_speech_segment(speech_ms)
+            return self._finalize_speech_segment(speech_ms, reason="shutdown")
         return None
 
     process_chunk = process_frame
-

@@ -63,6 +63,18 @@ class TestVoiceActivityDetector(unittest.TestCase):
         self.assertFalse(self.vad.is_speaking)
         self.assertGreater(len(final_segment), 6 * frame_size)
 
+    def test_acoustic_progress_tracks_samples_not_processing_time(self):
+        loud = np.full(480, 0.1, dtype=np.float32)
+        silent = np.zeros(480, dtype=np.float32)
+        self.vad.process_frame(loud)
+        self.vad.process_frame(silent)
+        self.assertEqual(self.vad.acoustic_progress, (0.06, 0.03))
+        for _ in range(10):
+            self.vad.process_frame(silent)
+        self.assertEqual(self.vad.acoustic_progress, (0.36, 0.03))
+        self.vad.reset()
+        self.assertEqual(self.vad.acoustic_progress, (0.0, 0.0))
+
     def test_reset(self):
         """Verifica que reset() limpie el estado interno por completo."""
         loud_frame = np.full(480, 0.1, dtype=np.float32)
